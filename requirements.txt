@@ -1,0 +1,14 @@
+numpy>=2.0,<2.3
+pandas>=2.2
+scipy>=1.13
+requests>=2.32
+openai>=1.54                   
+sentence-transformers>=3.0   
+folium>=0.18      
+geopandas>=1.0     
+shapely>=2.0     
+networkx>=2.8   
+PuLP>=2.9            
+python_tsp>=0.5      
+xyconvert>=0.1                   
+thefuzz>=0.22                    
