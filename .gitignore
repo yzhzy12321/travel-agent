@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+output
+model/data/*.npy
+model/data/*_zh.csv
+*.pdf
+README.md
+LICENSE
+imgs
