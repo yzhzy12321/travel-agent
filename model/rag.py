@@ -156,26 +156,13 @@ class SpatiotemporalRAG:
                                  poi_category: str,
                                  day_index: int = 0) -> str:
         """
-        获取单个 POI 的动态信息（开放时间、人流预估、注意事项）
-
-        实际部署时对接：
-          - 高德/百度 Place API → 实时开放状态
-          - 大众点评/美团 API → 实时排队/人流
-          - 景区官方 API → 临时闭馆/活动公告
-
-        Args:
-            poi_name: POI 名称
-            poi_category: POI 类别
-            day_index: 第几天
-
-        Returns:
-            动态上下文字符串
+        获取单个 POI 的动态信息（开放时间、人流预估、注意事项）。
         """
         weather = self.daily_weather[day_index]["weather"] if day_index < len(self.daily_weather) else ""
         day_of_week = self.daily_weather[day_index]["day_of_week"] if day_index < len(self.daily_weather) else "未知"
         is_weekend = day_of_week in ["周六", "周日"]
 
-        # 根据类别和天气生成模拟建议
+        # 根据类别和天气给出建议
         is_outdoor = poi_category in ["自然风光", "城市公园", "建筑地标", "历史街区", "主题乐园"]
         is_indoor = poi_category in ["博物馆/纪念馆", "文化艺术", "购物商圈", "美食街区", "宗教寺庙"]
 
@@ -502,8 +489,7 @@ def create_rag_for_trip(city: str,
     """
     为一次旅行创建 RAG 模块实例。
 
-    天气数据：自动使用 wttr.in 免费 API（无需注册、独立数据源），
-    网络不通时自动回退模拟数据。
+    天气数据：自动使用 wttr.in 免费 API，网络不通时跳过天气。
 
     Args:
         city: 城市（中文名，如"上海"）

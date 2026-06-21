@@ -47,7 +47,7 @@ class TravelAgent:
     """
     多日旅游规划 Agent
 
-    能力：
+    skills：
     - num_days: 行程天数（1-7天）
     - use_rag: 是否启用时空 RAG 上下文
     - travel_date: 出发日期
@@ -251,12 +251,10 @@ class TravelAgent:
             response = self.proxy.chat(messages=msg, model=self.MODEL).replace("'", '"')
             hours = json.loads(response)
             hours = [int(h) for h in hours]
-            # 确保长度匹配
             while len(hours) < self.num_days:
                 hours.append(5)
             return hours[:self.num_days]
         except Exception:
-            # 默认每天 5 小时
             return [5] * self.num_days
 
     def _get_daily_params(self) -> list:
@@ -475,24 +473,14 @@ class TravelAgent:
         else:
             rag_overview = ""
 
-        # Step 5: 每天生成行程
-        day_results = []
-        day_themes = []
-        global_poi_counter = 1  # 跨天序列号
+        # Step 5: 每天生成行程（并行化——各天之间无依赖）
+        day_jobs = []  # [(day_idx, day_order, context_string, must_see_string, spatiotemporal_ctx, hours, max_pois, day_theme), ...]
 
         for day_idx in range(self.num_days):
             day_order = day_orders[day_idx] if day_idx < len(day_orders) else []
 
             if len(day_order) == 0:
-                day_results.append({
-                    "day": day_idx + 1,
-                    "day_theme": "自由探索日",
-                    "itinerary": "自由安排",
-                    "day_reason": "当天无特定行程，建议自由探索城市",
-                    "weather_note": "无",
-                    "pois": {}
-                })
-                day_themes.append("自由探索")
+                day_jobs.append(None)  # 空占位
                 continue
 
             # 构建当天的 context_string
@@ -508,7 +496,6 @@ class TravelAgent:
             if self.use_rag:
                 ordered_names = self.user_favorites.loc[day_order]["name"].tolist()
                 ordered_cats = self.user_favorites.loc[day_order]["category"].tolist()
-                # 计算距离
                 ordered_with_loop = day_order + [day_order[0]]
                 locs = self.user_favorites.loc[ordered_with_loop][["x", "y"]].astype(float).to_numpy()
                 dists = np.sqrt(np.sum(np.diff(locs, axis=0) ** 2, axis=1))
@@ -532,12 +519,11 @@ class TravelAgent:
                 else:
                     day_theme = "深度城市探索日"
 
-            # 住宿点上下文（注入到时空上下文之后）
+            # 住宿点上下文
             hotel_ctx = self._build_hotel_context()
             if hotel_ctx:
                 spatiotemporal_ctx = spatiotemporal_ctx + "\n\n" + hotel_ctx if spatiotemporal_ctx else hotel_ctx
 
-            # 调用 LLM 生成当天行程
             hours = (
                 self.hours_per_day[day_idx]
                 if day_idx < len(self.hours_per_day) else 5
@@ -546,6 +532,16 @@ class TravelAgent:
                 self.daily_params[day_idx][1] if day_idx < len(self.daily_params) else 7,
                 len(day_order)
             )
+
+            day_jobs.append((day_idx, day_order, context_string, must_see_string,
+                           spatiotemporal_ctx, hours, max_pois, day_theme))
+
+        # ---- 并行 LLM 调用：所有天同时请求 ----
+        def _gen_one_day(args):
+            if args is None:
+                return None
+            day_idx, day_order, context_string, must_see_string, \
+                spatiotemporal_ctx, hours, max_pois, day_theme = args
 
             day_response = self._generate_day_plan(
                 day_index=day_idx,
@@ -582,19 +578,16 @@ class TravelAgent:
                 itinerary = day_data.get("itinerary", "")
                 if itinerary and "->" in itinerary:
                     raw_names = [s.strip() for s in itinerary.split("->")]
-                    # 模糊匹配 POI 名到数据库（LLM 可能输出略有不同的名称）
                     from thefuzz import process as fz
                     all_db_names = self.user_favorites["name"].tolist()
                     matched = []
                     for raw in raw_names:
                         if not raw:
                             continue
-                        # 先用精确匹配
                         exact = self.user_favorites[self.user_favorites["name"] == raw]
                         if len(exact) > 0:
                             matched.append(exact.index[0])
                         else:
-                            # 模糊匹配备选
                             best, score = fz.extract(raw, all_db_names, limit=1)[0]
                             if score > 80:
                                 idx = all_db_names.index(best)
@@ -608,6 +601,26 @@ class TravelAgent:
 
             day_data["transit_summary"] = transit_summary
             day_data["weather_context"] = weather_ctx
+            return day_data
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_days) as executor:
+            futures = [executor.submit(_gen_one_day, job) for job in day_jobs]
+            day_results_raw = [f.result() for f in futures]
+
+        # 组装结果（保持 day 顺序）
+        day_results = []
+        day_themes = []
+        for day_idx in range(self.num_days):
+            day_data = day_results_raw[day_idx]
+            if day_data is None:
+                day_data = {
+                    "day": day_idx + 1,
+                    "day_theme": "自由探索日",
+                    "itinerary": "自由安排",
+                    "day_reason": "当天无特定行程，建议自由探索城市",
+                    "weather_note": "无",
+                    "pois": {}
+                }
             day_results.append(day_data)
             day_themes.append(day_data.get("day_theme", f"Day {day_idx+1}"))
 
@@ -658,6 +671,8 @@ class TravelAgent:
             else "暂无必须选择的 POI"
         )
         return context_string, must_see_string
+
+
 
     def _check_reverse(self, day_order):
         """检查当天的 POI 顺序是否需要反转"""
@@ -783,6 +798,20 @@ class TravelAgent:
             m.save(f'./model/output/{map_filename}')
             return m
 
+        # ---- 辅助：从 LLM 响应中提取实际选中的 POI ----
+        def _get_selected_pois(day_order, day_data):
+            """从 LLM 返回的 pois dict 中提取实际选中的 POI 子集"""
+            pois_dict = day_data.get("pois", {}) if day_data else {}
+            if pois_dict:
+                try:
+                    selected_seq = [int(k) for k in pois_dict.keys()]
+                    selected_indices = np.array(day_order)[np.array(selected_seq) - 1]
+                    return self.user_favorites.loc[selected_indices]
+                except Exception:
+                    pass
+            # fallback：LLM 未返回 pois 或解析失败时，用全部候选
+            return self.user_favorites.loc[day_order]
+
         # ---- 单日模式 ----
         if self.num_days == 1:
             day_data = result["days"][0] if result.get("days") else {}
@@ -791,25 +820,16 @@ class TravelAgent:
             if len(day_order) == 0:
                 return
 
-            # 全量 TSP 路径图
+            # 全量 TSP 候选路径图（调试用，保留）
             df_full = self.user_favorites.loc[day_order]
             _create_map(df_full, map_filename=f"{current_time}_{self.type}_fulltsp.html")
 
-            # 从 LLM 响应中提取实际选中的 POI
-            pois_dict = day_data.get("pois", {})
-            if pois_dict:
-                try:
-                    selected_seq = [int(k) for k in pois_dict.keys()]
-                    selected_indices = np.array(day_order)[np.array(selected_seq) - 1]
-                    df_selected = self.user_favorites.loc[selected_indices]
-                except Exception:
-                    df_selected = df_full.head(min(10, len(df_full)))
-            else:
-                df_selected = df_full.head(min(10, len(df_full)))
+            # LLM 精选路线图
+            df_selected = _get_selected_pois(day_order, day_data)
 
             _create_map(df_selected, map_filename=f"{current_time}_{self.type}.html")
 
-            # 聚类圆图
+            # 聚类圆图（使用精选 POI）
             clusters = day_clusters[0] if day_clusters else [list(day_order)]
             centroids = self.spatial_handler.get_cluster_centroids(clusters, lonlat=True)
             radius = self.spatial_handler.citywalk_thresh
@@ -835,24 +855,16 @@ class TravelAgent:
         else:
             day_colors = ["green", "blue", "purple", "orange", "red", "teal", "darkblue"]
 
+            # 预先计算每天的精选 POI DataFrame（供每日图和总览图共用）
+            day_selected_dfs = []
             for day_idx in range(min(self.num_days, len(day_orders))):
                 day_order = day_orders[day_idx]
                 if len(day_order) == 0:
+                    day_selected_dfs.append(None)
                     continue
-
-                # 获取当天 LLM 选中的 POI
                 day_data = result["days"][day_idx] if day_idx < len(result["days"]) else {}
-                pois_dict = day_data.get("pois", {})
-
-                if pois_dict:
-                    try:
-                        selected_seq = [int(k) for k in pois_dict.keys()]
-                        selected_indices = np.array(day_order)[np.array(selected_seq) - 1]
-                        df_day = self.user_favorites.loc[selected_indices]
-                    except Exception:
-                        df_day = self.user_favorites.loc[day_order]
-                else:
-                    df_day = self.user_favorites.loc[day_order]
+                df_day = _get_selected_pois(day_order, day_data)
+                day_selected_dfs.append(df_day)
 
                 color = day_colors[day_idx % len(day_colors)]
                 _create_map(
@@ -861,17 +873,15 @@ class TravelAgent:
                     map_filename=f"{current_time}_{self.type}_day{day_idx+1}.html"
                 )
 
-            # 总览图：所有天的路线叠加，不同颜色
-            all_dfs = []
+            # 总览图：使用 LLM 精选后的 POI（与每日图保持一致）
             m = folium.Map(location=[31.23, 121.47], zoom_start=12)
             all_lats, all_lons = [], []
 
-            for day_idx in range(min(self.num_days, len(day_orders))):
-                day_order = day_orders[day_idx]
-                if len(day_order) == 0:
+            for day_idx, df_day in enumerate(day_selected_dfs):
+                if df_day is None or len(df_day) == 0:
                     continue
                 color = day_colors[day_idx % len(day_colors)]
-                df_day = self.user_favorites.loc[day_order].copy()
+                df_day = df_day.copy()
                 gcj = np.array(df_day[['lon', 'lat']])
                 wgs = gcj2wgs(gcj)
                 df_day['lon'], df_day['lat'] = wgs[:, 0], wgs[:, 1]
@@ -897,7 +907,7 @@ class TravelAgent:
 
             print(f"🗺️  地图已保存: {current_time}_{self.type}_day*.html + _overview.html ({self.num_days+1} 张)")
 
-    # ========== 兼容接口 ==========
+    # ========== 对外接口 ==========
 
     def solve(self):
         """solve() 接口：多日模式"""

@@ -82,8 +82,6 @@ def find_nearby_pois_3level(df):
 
     return walk_list, bike_list, transit_list
 
-    return nearby_list
-
 
 def build_city_csv(city_name, poi_file, start_id=10001):
     """
