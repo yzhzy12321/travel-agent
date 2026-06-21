@@ -7,6 +7,7 @@ import pandas as pd
 import networkx as nx
 import datetime
 import folium
+import requests
 from python_tsp.heuristics import solve_tsp_simulated_annealing
 from model.utils.funcs import get_max_summation_idx, get_top_k_sets, get_topk_location_pairs, find_clusters_containing_all_elements
 from itertools import permutations
@@ -20,6 +21,8 @@ class SpatialHandler:
         self.min_clusters = min_clusters
         self.citywalk = citywalk
         self.citywalk_thresh = citywalk_thresh
+        # 真实道路距离缓存: {(id1, id2): distance_m}
+        self._road_dist_cache = {}
 
     def remove_outliers(self, poi_candidates: list, selected_clusters: list):
         # Fetch the coordinates of the POI candidates
@@ -141,12 +144,90 @@ class SpatialHandler:
 
         return value(prob.objective), path
     
+    def _get_road_dist_matrix(self, poi_idlist: list) -> np.ndarray:
+        """
+        通过 OSRM 免费 API 获取 POI 之间的真实驾车距离矩阵。
+        结果缓存于 self._road_dist_cache，同一 POI 对不重复请求。
+
+        Args:
+            poi_idlist: POI ID 列表（DataFrame 索引）
+
+        Returns:
+            np.ndarray: N×N 距离矩阵（米），失败时返回 None
+        """
+        n = len(poi_idlist)
+        dist_matrix = np.zeros((n, n))
+
+        # 收集需要查询的 POI 对（查缓存）
+        pairs_to_query = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                key = (min(poi_idlist[i], poi_idlist[j]),
+                       max(poi_idlist[i], poi_idlist[j]))
+                if key in self._road_dist_cache:
+                    d = self._road_dist_cache[key]
+                    dist_matrix[i, j] = d
+                    dist_matrix[j, i] = d
+                else:
+                    pairs_to_query.append((i, j, key))
+
+        if not pairs_to_query:
+            return dist_matrix
+
+        # 批量查询 OSRM
+        print(f"  🚗 OSRM 真实道路距离：查询 {len(pairs_to_query)} 对...", end=" ")
+        queried = 0
+        failed = 0
+        for i, j, key in pairs_to_query:
+            id_i = poi_idlist[i]
+            id_j = poi_idlist[j]
+            try:
+                lon1, lat1 = (float(self.data.loc[id_i, "lon"]),
+                              float(self.data.loc[id_i, "lat"]))
+                lon2, lat2 = (float(self.data.loc[id_j, "lon"]),
+                              float(self.data.loc[id_j, "lat"]))
+            except Exception:
+                failed += 1
+                continue
+
+            d = self._fetch_osrm_distance(lon1, lat1, lon2, lat2)
+            if d is not None:
+                self._road_dist_cache[key] = d
+                dist_matrix[i, j] = d
+                dist_matrix[j, i] = d
+                queried += 1
+            else:
+                failed += 1
+                # fallback: 用直线距离 * 1.4（城市道路系数）
+                loc_i = self.data.loc[id_i][["x", "y"]].astype(float).to_numpy()
+                loc_j = self.data.loc[id_j][["x", "y"]].astype(float).to_numpy()
+                d_euclid = np.linalg.norm(loc_i - loc_j)
+                dist_matrix[i, j] = d_euclid * 1.4
+                dist_matrix[j, i] = d_euclid * 1.4
+
+        print(f"✅ {queried} 成功" + (f", {failed} 失败(已fallback)" if failed else ""))
+        return dist_matrix
+
+    def _fetch_osrm_distance(self, lon1, lat1, lon2, lat2) -> int | None:
+        """调 OSRM 获取两点驾车距离（米），失败返回 None"""
+        try:
+            url = (f"https://router.project-osrm.org/route/v1/driving/"
+                   f"{lon1},{lat1};{lon2},{lat2}?overview=false")
+            resp = requests.get(url, timeout=8)
+            data = resp.json()
+            if data.get("code") == "Ok" and data.get("routes"):
+                return int(data["routes"][0]["distance"])
+        except Exception:
+            pass
+        return None
+
     def get_tsp_order(self, poi_candidates_list: list = None, locs: list = None):
         """
         Find the optimal traveling salesman problem (TSP) order for a list of points.
 
         Args:
             poi_candidates_list (list): A list of point identifiers for candidate locations.
+                                        If None, only locs must be provided (used for cluster centroids).
 
         Returns:
             tuple: A tuple containing the following elements:
@@ -157,7 +238,20 @@ class SpatialHandler:
 
         if locs is None:
             locs = self.data.loc[poi_candidates_list, ["x", "y"]].astype(float).to_numpy()
-        dist_matrix = scipy.spatial.distance.cdist(locs, locs)
+
+        # ---- 旧：直线距离（保留注释）----
+        # dist_matrix = scipy.spatial.distance.cdist(locs, locs)
+
+        # ---- 新：OSRM 真实道路距离（需要 poi_ids；聚类中心点退回直线）----
+        if poi_candidates_list is not None and len(poi_candidates_list) >= 2:
+            dist_matrix = self._get_road_dist_matrix(poi_candidates_list)
+        else:
+            dist_matrix = None
+
+        if dist_matrix is None:
+            # fallback: 直线距离（聚类中心点或 OSRM 失败时）
+            dist_matrix = scipy.spatial.distance.cdist(locs, locs)
+
         if locs.shape[0] > 2:
             order, distance = solve_tsp_simulated_annealing(dist_matrix)
         elif locs.shape[0] == 2:
