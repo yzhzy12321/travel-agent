@@ -38,7 +38,7 @@ from model.utils.all_prompts import (
 from model.search import SearchEngine
 from model.spatial import SpatialHandler
 from model.rag import SpatiotemporalRAG, create_rag_for_trip
-from model.config import CITY_ZH_MAP, MULTIDAY_TIME2NUM, LLM_MODEL
+from model.config import CITY_ZH_MAP, MULTIDAY_TIME2NUM, LLM_MODEL, GaodeMap_apikey
 from thefuzz import process as fuzz_process  # 酒店名称模糊匹配
 
 
@@ -811,13 +811,20 @@ class TravelAgent:
         current_time = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
 
         def _create_map(df, polyline_color="green", map_filename="", extra_circles=None):
-            """创建单张 Folium 地图"""
+            """创建单张 Folium 地图（高德瓦片 GCJ-02，数据已是 GCJ-02）"""
             df = df.copy()
 
             m = folium.Map(
                 location=[df['lat'].mean(), df['lon'].mean()],
-                zoom_start=13
+                zoom_start=13,
+                tiles=None
             )
+            folium.TileLayer(
+                tiles='https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+                attr='高德地图',
+                subdomains='1234',
+                max_zoom=18
+            ).add_to(m)
             for i, (_, row) in enumerate(df.iterrows()):
                 folium.Marker(
                     location=[row['lat'], row['lon']],
@@ -934,8 +941,14 @@ class TravelAgent:
                     map_filename=f"{current_time}_{self.type}_day{day_idx+1}.html"
                 )
 
-            # 总览图：使用 LLM 精选后的 POI（与每日图保持一致）
-            m = folium.Map(location=[31.23, 121.47], zoom_start=12)
+            # 总览图：高德瓦片 + GCJ-02 转换
+            m = folium.Map(location=[31.23, 121.47], zoom_start=12, tiles=None)
+            folium.TileLayer(
+                tiles='https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+                attr='高德地图',
+                subdomains='1234',
+                max_zoom=18
+            ).add_to(m)
             all_lats, all_lons = [], []
 
             for day_idx, df_day in enumerate(day_selected_dfs):
@@ -943,6 +956,7 @@ class TravelAgent:
                     continue
                 color = day_colors[day_idx % len(day_colors)]
                 df_day = df_day.copy()
+                # 数据已是 GCJ-02，直接使用
 
                 for _, row in df_day.iterrows():
                     folium.CircleMarker(

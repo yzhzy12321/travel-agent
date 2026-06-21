@@ -8,6 +8,7 @@ Travel Agent: 多日长行程 + RAG 时空感知旅游规划
 """
 
 import argparse
+import os
 from model.utils.proxy_call import OpenaiCall
 from model.agent import TravelAgent
 
@@ -28,6 +29,8 @@ def arg_parse(parser):
                         help='住宿点名称（模糊匹配POI库，如"外滩"、"南京路"）')
     parser.add_argument('--exclude', type=str, default=None,
                         help='要排除的景点，逗号分隔（如"鼓山,西湖公园"），模糊匹配 POI 库')
+    parser.add_argument('--serve', action='store_true', default=False,
+                        help='生成后启动本地 HTTP 服务器（高德地图需从 http:// 访问）')
     return parser.parse_args()
 
 
@@ -83,6 +86,23 @@ def run(args) -> None:
                     print(f"  {line.strip()}")
         if day.get('weather_note') and day['weather_note'] != '无':
             print(f"  🌤️ 天气提示: {day['weather_note']}")
+
+    # 高德地图需从 http:// 访问，提供一键启动本地服务器
+    if args.serve:
+        import http.server
+        import socketserver
+        import threading
+        import webbrowser
+        PORT = 8899
+        os.chdir("./model/output")
+        handler = http.server.SimpleHTTPRequestHandler
+        with socketserver.TCPServer(("", PORT), handler) as httpd:
+            url = f"http://localhost:{PORT}/"
+            print(f"\n🌐 本地服务器已启动: {url}")
+            print(f"   在浏览器打开上述地址，点击 HTML 文件即可查看高德地图")
+            print(f"   按 Ctrl+C 停止服务器")
+            webbrowser.open(url)
+            httpd.serve_forever()
 
 
 if __name__ == '__main__':
