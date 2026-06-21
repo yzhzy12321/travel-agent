@@ -24,7 +24,6 @@ import numpy as np
 import folium
 import concurrent.futures
 from typing import Optional
-from xyconvert import gcj2wgs
 
 from model.utils.funcs import (
     RecurringList, compute_consecutive_distances, find_indices,
@@ -67,7 +66,8 @@ class TravelAgent:
                  citywalk: bool = True,
                  use_rag: bool = True,
                  travel_date: Optional[str] = None,
-                 hotel: Optional[str] = None):
+                 hotel: Optional[str] = None,
+                 exclude_pois: Optional[list] = None):
         """
         初始化 Travel Agent
 
@@ -85,6 +85,7 @@ class TravelAgent:
             use_rag: 是否启用 RAG 时空感知
             travel_date: 出发日期 (YYYY-MM-DD)
             hotel: 住宿点名称（模糊匹配 POI 库，None 则不启用住宿模式）
+            exclude_pois: 要排除的景点名称列表（模糊匹配 POI 库）
         """
         self.MODEL = LLM_MODEL
         self.type = type
@@ -99,6 +100,7 @@ class TravelAgent:
         self.min_poi_candidate_num = min_poi_candidate_num
         self.use_rag = use_rag
         self.hotel_name = hotel
+        self.exclude_poi_names = exclude_pois or []
 
         # ---- 确定每天参数 ----
         if hours_per_day is not None:
@@ -157,6 +159,12 @@ class TravelAgent:
         self.hotel_info = None
         if self.hotel_name:
             self._match_hotel()
+
+        # ---- 排除景点匹配 ----
+        self.exclude_poi_ids = set()
+        self.exclude_poi_matched = []  # [(输入名, 匹配名, 得分), ...]
+        if self.exclude_poi_names:
+            self._match_exclude_pois()
 
     # ========== 住宿点 ==========
 
@@ -238,6 +246,31 @@ class TravelAgent:
                 mode = "🚶步行" if dist < 1000 else "🚲骑行"
                 lines.append(f"    {name}（{cat}）— {dist}m {mode}可达")
 
+        return "\n".join(lines)
+
+    # ========== 排除景点 ==========
+
+    def _match_exclude_pois(self):
+        """模糊匹配要排除的景点名到 POI 库"""
+        all_names = self.user_favorites["name"].tolist()
+        for exclude_name in self.exclude_poi_names:
+            match, score = fuzz_process.extract(exclude_name, all_names, limit=1)[0]
+            if score >= 60:
+                idx = all_names.index(match)
+                self.exclude_poi_ids.add(self.user_favorites.index[idx])
+                self.exclude_poi_matched.append((exclude_name, match, score))
+                print(f"🚫 排除景点: {match} (输入: '{exclude_name}', 得分: {score})")
+            else:
+                print(f"⚠️ 未匹配到排除景点: '{exclude_name}' (最佳: '{match}', 得分: {score})")
+
+    def _build_exclude_context(self) -> str:
+        """构建排除景点上下文，注入 LLM prompt"""
+        if not self.exclude_poi_matched:
+            return ""
+
+        lines = ["### 🚫 用户明确排除的景点（绝对不要加入行程）"]
+        for orig, matched, score in self.exclude_poi_matched:
+            lines.append(f"- **{matched}**（用户输入: '{orig}'）")
         return "\n".join(lines)
 
     # ========== 参数推断 ==========
@@ -433,11 +466,16 @@ class TravelAgent:
         # Step 1: 检索候选 POI
         req_topk_pois, pseudo_must_see_pois = self._get_reqs_topk()
 
-        # Step 2: 多日 POI 分配（含住宿点周边增强）
+        # Step 2: 多日 POI 分配（含住宿点周边增强 + 排除景点过滤）
         allpoi_idlist = (
             req_topk_pois[:, 0].astype(int).tolist()
             + self.must_see_pois
         )
+        # 排除用户指定的景点
+        if self.exclude_poi_ids:
+            before = len(allpoi_idlist)
+            allpoi_idlist = [pid for pid in allpoi_idlist if pid not in self.exclude_poi_ids]
+            print(f"🚫 已从候选池排除 {before - len(allpoi_idlist)} 个景点")
         # 住宿点周边 POI 加入候选池
         if self.hotel_poi_id is not None:
             hotel_nearby = self._get_hotel_nearby()
@@ -523,6 +561,11 @@ class TravelAgent:
             hotel_ctx = self._build_hotel_context()
             if hotel_ctx:
                 spatiotemporal_ctx = spatiotemporal_ctx + "\n\n" + hotel_ctx if spatiotemporal_ctx else hotel_ctx
+
+            # 排除景点上下文
+            exclude_ctx = self._build_exclude_context()
+            if exclude_ctx:
+                spatiotemporal_ctx = spatiotemporal_ctx + "\n\n" + exclude_ctx if spatiotemporal_ctx else exclude_ctx
 
             hours = (
                 self.hours_per_day[day_idx]
@@ -638,6 +681,10 @@ class TravelAgent:
                 {"name": n, "category": c, "distance_m": d}
                 for _, n, c, d in self._get_hotel_nearby()
             ] if self.hotel_poi_id else [],
+            "exclude": [
+                {"input": orig, "matched": matched, "score": score}
+                for orig, matched, score in self.exclude_poi_matched
+            ] if self.exclude_poi_matched else None,
             "rag_context": rag_overview,
             "daily_summary": overview.get("daily_summary", []),
             "days": day_results
@@ -765,10 +812,7 @@ class TravelAgent:
 
         def _create_map(df, polyline_color="green", map_filename="", extra_circles=None):
             """创建单张 Folium 地图"""
-            gcj_coords = np.array(df[['lon', 'lat']])
-            wgs_coords = gcj2wgs(gcj_coords)
             df = df.copy()
-            df['lon'], df['lat'] = wgs_coords[:, 0], wgs_coords[:, 1]
 
             m = folium.Map(
                 location=[df['lat'].mean(), df['lon'].mean()],
@@ -800,16 +844,33 @@ class TravelAgent:
 
         # ---- 辅助：从 LLM 响应中提取实际选中的 POI ----
         def _get_selected_pois(day_order, day_data):
-            """从 LLM 返回的 pois dict 中提取实际选中的 POI 子集"""
+            """从 LLM 返回的 pois dict 中提取实际选中的 POI 子集（兼容数字key和名称key）"""
             pois_dict = day_data.get("pois", {}) if day_data else {}
-            if pois_dict:
-                try:
-                    selected_seq = [int(k) for k in pois_dict.keys()]
-                    selected_indices = np.array(day_order)[np.array(selected_seq) - 1]
-                    return self.user_favorites.loc[selected_indices]
-                except Exception:
-                    pass
-            # fallback：LLM 未返回 pois 或解析失败时，用全部候选
+            if not pois_dict:
+                return self.user_favorites.loc[day_order]
+
+            # 方案1：数字 key → 按序号从 day_order 取
+            try:
+                selected_seq = [int(k) for k in pois_dict.keys()]
+                selected_indices = np.array(day_order)[np.array(selected_seq) - 1]
+                return self.user_favorites.loc[selected_indices]
+            except (ValueError, IndexError):
+                pass
+
+            # 方案2：名称 key → 模糊匹配回 POI 库
+            from thefuzz import process as fz
+            all_names = self.user_favorites["name"].tolist()
+            matched = []
+            for key in pois_dict.keys():
+                best, score = fz.extract(key, all_names, limit=1)[0]
+                if score > 80:
+                    idx = all_names.index(best)
+                    if idx not in matched:
+                        matched.append(idx)
+            if matched:
+                return self.user_favorites.loc[matched]
+
+            # 终极 fallback
             return self.user_favorites.loc[day_order]
 
         # ---- 单日模式 ----
@@ -882,9 +943,6 @@ class TravelAgent:
                     continue
                 color = day_colors[day_idx % len(day_colors)]
                 df_day = df_day.copy()
-                gcj = np.array(df_day[['lon', 'lat']])
-                wgs = gcj2wgs(gcj)
-                df_day['lon'], df_day['lat'] = wgs[:, 0], wgs[:, 1]
 
                 for _, row in df_day.iterrows():
                     folium.CircleMarker(

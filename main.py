@@ -26,6 +26,8 @@ def arg_parse(parser):
                         help='出发日期 YYYY-MM-DD')
     parser.add_argument('--hotel', type=str, default=None,
                         help='住宿点名称（模糊匹配POI库，如"外滩"、"南京路"）')
+    parser.add_argument('--exclude', type=str, default=None,
+                        help='要排除的景点，逗号分隔（如"鼓山,西湖公园"），模糊匹配 POI 库')
     return parser.parse_args()
 
 
@@ -36,6 +38,11 @@ def run(args) -> None:
              f"体验当地的历史文化与现代风貌，品尝地道美食，"
              f"逛逛特色街区和公园。")
 
+    # 解析排除景点列表
+    exclude_pois = None
+    if args.exclude:
+        exclude_pois = [name.strip() for name in args.exclude.split(',') if name.strip()]
+
     planner = TravelAgent(
         user_reqs=[query],
         city=args.city,
@@ -45,7 +52,8 @@ def run(args) -> None:
         use_rag=args.use_rag,
         travel_date=args.date,
         citywalk=True,
-        hotel=args.hotel
+        hotel=args.hotel,
+        exclude_pois=exclude_pois
     )
     result = planner.solve_multiday()
 
