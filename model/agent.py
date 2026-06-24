@@ -67,7 +67,9 @@ class TravelAgent:
                  use_rag: bool = True,
                  travel_date: Optional[str] = None,
                  hotel: Optional[str] = None,
-                 exclude_pois: Optional[list] = None):
+                 exclude_pois: Optional[list] = None,
+                 start_time: str = "08:00",
+                 end_time: str = "20:00"):
         """
         初始化 Travel Agent
 
@@ -86,13 +88,19 @@ class TravelAgent:
             travel_date: 出发日期 (YYYY-MM-DD)
             hotel: 住宿点名称（模糊匹配 POI 库，None 则不启用住宿模式）
             exclude_pois: 要排除的景点名称列表（模糊匹配 POI 库）
+            start_time: 每天出发时间 "HH:MM"（默认 08:00）
+            end_time: 每天结束时间 "HH:MM"（默认 20:00）
         """
         self.MODEL = LLM_MODEL
         self.type = type
         self.proxy = proxy_call
         self.city = city
-        self.city_zh = CITY_ZH_MAP.get(city, city)  # 中文显示名
+        self.city_zh = CITY_ZH_MAP.get(city, city)
         self.num_days = num_days
+        self.citywalk = citywalk
+        self.user_reqs = user_reqs
+        self.start_time = start_time
+        self.end_time = end_time
         self.citywalk = citywalk
         self.user_reqs = user_reqs
         self.keep_prob = keep_prob
@@ -135,7 +143,8 @@ class TravelAgent:
             min_clusters=self.daily_params[0][0],
             min_pois=self.daily_params[0][1],
             citywalk=self.citywalk,
-            citywalk_thresh=self.daily_params[0][2]
+            citywalk_thresh=self.daily_params[0][2],
+            start_time=self.start_time
         )
 
         # ---- RAG 模块 ----
@@ -455,7 +464,7 @@ class TravelAgent:
                 ]
             }
         """
-        print(f"\n{'='*30}")
+        # print(f"\n{'='*30}")
         print(f"🌍 Travel Agent: {self.num_days}天 {self.city_zh} 行程规划")
         if self.use_rag:
             print(f"📡 RAG 时空感知: 启用")
@@ -497,7 +506,13 @@ class TravelAgent:
                 thresh=self.thresh
             )
 
-        # Step 3: 每天 TSP 排序
+        # Step 3: 每天 TSP 排序（注入品质分数做多目标优化）
+        # 构建 POI 品质分数映射（来自搜索相似度，越高越好）
+        poi_score_map = {}
+        for row in req_topk_pois:
+            poi_score_map[int(row[0])] = float(row[1])
+        self.spatial_handler.poi_scores = poi_score_map
+
         day_orders = self.spatial_handler.get_multiday_full_order(
             day_poi_candidates, day_clusters
         )
@@ -614,6 +629,80 @@ class TravelAgent:
 
             day_data["day"] = day_idx + 1
 
+            # ---- 安全网：检测并修复 LLM 用名字做 pois key 的违规 ----
+            pois_dict = day_data.get("pois", {})
+            if pois_dict:
+                keys_are_names = not all(str(k).isdigit() for k in pois_dict.keys())
+                if keys_are_names and day_order:
+                    # 构建当天候选的名称→序号 映射
+                    from thefuzz import process as fz
+                    candidate_names = [self.user_favorites.loc[pid, "name"] for pid in day_order]
+                    fixed_pois = {}
+                    for name_key, desc in pois_dict.items():
+                        best, score = fz.extract(str(name_key), candidate_names, limit=1)[0]
+                        if score > 80:
+                            seq = candidate_names.index(best) + 1  # 1-based
+                            fixed_pois[str(seq)] = desc
+                    if fixed_pois:
+                        day_data["pois"] = fixed_pois
+                        # 同时修复 itinerary：用候选中匹配到的正确名称重建
+                        fixed_names = []
+                        for seq_str in sorted(fixed_pois.keys(), key=int):
+                            pid = day_order[int(seq_str) - 1]
+                            fixed_names.append(self.user_favorites.loc[pid, "name"])
+                        if fixed_names:
+                            day_data["itinerary"] = " -> ".join(fixed_names)
+
+            # 规范化 itinerary：LLM 可能输出序号 → 转为景点名称
+            raw_itinerary = day_data.get("itinerary", "")
+            if raw_itinerary and day_order:
+                tokens = [t.strip() for t in raw_itinerary.split("->")]
+                # 检测是否为纯序号（如 "1 -> 7 -> 6"）
+                if all(t.isdigit() for t in tokens if t):
+                    seqs = [int(t) - 1 for t in tokens if t.isdigit()]
+                    names = []
+                    for s in seqs:
+                        if 0 <= s < len(day_order):
+                            names.append(
+                                self.user_favorites.loc[day_order[s], "name"]
+                            )
+                    if names:
+                        day_data["itinerary"] = " -> ".join(names)
+                        # 同时更新 pois 的 key 为名称（便于后续匹配）
+                        if day_data.get("pois"):
+                            old_pois = day_data["pois"]
+                            new_pois = {}
+                            for k, v in old_pois.items():
+                                try:
+                                    seq = int(k) - 1
+                                    if 0 <= seq < len(day_order):
+                                        new_key = self.user_favorites.loc[day_order[seq], "name"]
+                                        new_pois[new_key] = v
+                                    else:
+                                        new_pois[k] = v
+                                except (ValueError, KeyError):
+                                    new_pois[k] = v
+                            day_data["pois"] = new_pois
+
+            # LLM 精选后重优化：对选中的 POI 重新 TSP（可能更短）
+            itinerary_names = [s.strip() for s in day_data.get("itinerary", "").split("->") if s.strip()]
+            if len(itinerary_names) >= 3:
+                # 名称→ID 匹配，但限制在当天候选集内（防止匹配到远处同名POI）
+                candidate_name_to_id = {
+                    self.user_favorites.loc[pid, "name"]: pid
+                    for pid in day_order
+                }
+                selected_ids = []
+                for n in itinerary_names:
+                    pid = candidate_name_to_id.get(n)
+                    if pid is not None:
+                        selected_ids.append(pid)
+                if len(selected_ids) >= 3:
+                    reorder, _, _ = self.spatial_handler.get_tsp_order(selected_ids)
+                    new_names = [self.user_favorites.loc[selected_ids[i], "name"] for i in reorder]
+                    if new_names != itinerary_names:
+                        day_data["itinerary"] = " -> ".join(new_names)
+
             # 交通/天气：只对 LLM 实际选中的 POI 计算
             transit_summary = ""
             weather_ctx = ""
@@ -621,20 +710,24 @@ class TravelAgent:
                 itinerary = day_data.get("itinerary", "")
                 if itinerary and "->" in itinerary:
                     raw_names = [s.strip() for s in itinerary.split("->")]
+                    # 名称→ID 匹配，限制在当天候选集内
+                    candidate_name_to_id = {
+                        self.user_favorites.loc[pid, "name"]: pid
+                        for pid in day_order
+                    }
                     from thefuzz import process as fz
-                    all_db_names = self.user_favorites["name"].tolist()
+                    candidate_names = list(candidate_name_to_id.keys())
                     matched = []
                     for raw in raw_names:
                         if not raw:
                             continue
-                        exact = self.user_favorites[self.user_favorites["name"] == raw]
-                        if len(exact) > 0:
-                            matched.append(exact.index[0])
+                        pid = candidate_name_to_id.get(raw)
+                        if pid is not None:
+                            matched.append(pid)
                         else:
-                            best, score = fz.extract(raw, all_db_names, limit=1)[0]
+                            best, score = fz.extract(raw, candidate_names, limit=1)[0]
                             if score > 80:
-                                idx = all_db_names.index(best)
-                                matched.append(idx)
+                                matched.append(candidate_name_to_id[best])
                     if len(matched) >= 2:
                         selected_names = [self.user_favorites.loc[i, "name"] for i in matched]
                         locs = self.user_favorites.loc[matched][["x", "y"]].astype(float).to_numpy()
@@ -644,6 +737,58 @@ class TravelAgent:
 
             day_data["transit_summary"] = transit_summary
             day_data["weather_context"] = weather_ctx
+
+            # 生成时间线："几点到哪"
+            timeline = self._build_timeline(day_data, day_order, day_idx)
+            day_data["timeline"] = timeline
+
+            # 最终输出：将 pois 的数字 key 转为景点名称，并确保与 itinerary 一致
+            pois_dict = day_data.get("pois", {})
+            itinerary_names = [s.strip() for s in day_data.get("itinerary", "").split("->") if s.strip()]
+
+            if pois_dict and day_order:
+                # 先尝试数字 key → 名称
+                try:
+                    new_pois = {}
+                    for k, v in pois_dict.items():
+                        seq = int(k) - 1
+                        if 0 <= seq < len(day_order):
+                            name = self.user_favorites.loc[day_order[seq], "name"]
+                            new_pois[name] = v
+                        else:
+                            new_pois[k] = v
+                    pois_dict = new_pois
+                except (ValueError, KeyError):
+                    pass  # 已经是名称 key
+
+                # 校验：pois 的 key 必须和 itinerary 一致
+                pois_keys = set(pois_dict.keys())
+                it_set = set(itinerary_names)
+                if pois_keys != it_set and itinerary_names:
+                    # 不一致 → 用 itinerary 重建 pois
+                    rebuilt = {}
+                    old_descs = list(pois_dict.values())  # 保留 LLM 的描述（顺序可能不同）
+                    for i, name in enumerate(itinerary_names):
+                        # 尝试从旧 pois 中找匹配的描述（模糊匹配名称）
+                        desc = None
+                        for old_name, old_desc in pois_dict.items():
+                            if name in old_name or old_name in name:
+                                desc = old_desc
+                                break
+                        if desc is None and i < len(old_descs):
+                            desc = old_descs[i]  # 按位置 fallback
+                        if desc is None:
+                            # 最终 fallback：用数据中的 context
+                            match = self.user_favorites[self.user_favorites["name"] == name]
+                            if len(match) > 0:
+                                desc = str(match.iloc[0].get("context", ""))
+                        if desc:
+                            rebuilt[name] = str(desc)
+                    if rebuilt:
+                        pois_dict = rebuilt
+
+            day_data["pois"] = pois_dict
+
             return day_data
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_days) as executor:
@@ -696,6 +841,113 @@ class TravelAgent:
 
     # ========== 辅助方法 ==========
 
+    def _build_timeline(self, day_data: dict, day_order: list, day_idx: int) -> str:
+        """
+        根据 LLM 精选路线、道路距离和时间窗，生成"几点到哪"时间线。
+
+        Returns:
+            str: 格式化的时间线文本
+        """
+        itinerary = day_data.get("itinerary", "")
+        if not itinerary or "->" not in itinerary:
+            return ""
+
+        raw_names = [s.strip() for s in itinerary.split("->") if s.strip()]
+        if len(raw_names) < 2:
+            return ""
+
+        # 模糊匹配 POI 名 → 获取坐标和时间窗
+        from thefuzz import process as fz
+        all_db_names = self.user_favorites["name"].tolist()
+        matched_ids = []
+        for raw in raw_names:
+            exact = self.user_favorites[self.user_favorites["name"] == raw]
+            if len(exact) > 0:
+                matched_ids.append(exact.index[0])
+            else:
+                best, score = fz.extract(raw, all_db_names, limit=1)[0]
+                if score > 80:
+                    matched_ids.append(all_db_names.index(best))
+
+        if len(matched_ids) < 2:
+            return ""
+
+        # 获取坐标
+        locs = self.user_favorites.loc[matched_ids][["lon", "lat"]].astype(float).to_numpy()
+        # 获取道路距离（用缓存或 OSRM）
+        dists_m = []
+        for i in range(len(matched_ids) - 1):
+            # 尝试从缓存获取
+            import numpy as np
+            key = (min(matched_ids[i], matched_ids[i+1]),
+                   max(matched_ids[i], matched_ids[i+1]))
+            if hasattr(self.spatial_handler, '_road_dist_cache') and \
+               key in self.spatial_handler._road_dist_cache:
+                d = self.spatial_handler._road_dist_cache[key]
+            else:
+                d = np.sqrt((locs[i][0]-locs[i+1][0])**2 + (locs[i][1]-locs[i+1][1])**2) * 111000
+            dists_m.append(d)
+
+        # 获取时间窗
+        opens_str = []
+        closes_str = []
+        for mid in matched_ids:
+            try:
+                opens_str.append(str(self.user_favorites.loc[mid, "open_time"]))
+                closes_str.append(str(self.user_favorites.loc[mid, "close_time"]))
+            except KeyError:
+                opens_str.append("09:00")
+                closes_str.append("18:00")
+
+        def to_min(s):
+            parts = s.split(':')
+            return int(parts[0]) * 60 + int(parts[1])
+
+        def to_str(m):
+            h, mi = divmod(m, 60)
+            return f"{h:02d}:{mi:02d}"
+
+        START = int(self.start_time.split(":")[0]) * 60 + int(self.start_time.split(":")[1])
+        SPEED = 500     # m/min 城市车速
+
+        lines = ["### 🕐 预计时间线"]
+        prev_depart = START  # 上一站的实际离开时间，用实际停留（可能被关门截断）
+
+        for i, mid in enumerate(matched_ids):
+            name = self.user_favorites.loc[mid, "name"]
+            open_t = to_min(opens_str[i])
+            close_t = to_min(closes_str[i])
+            # 从数据读取停留时长，默认 60min
+            try:
+                visit = int(self.user_favorites.loc[mid, "visittime"])
+            except (KeyError, ValueError):
+                visit = 60
+
+            if i == 0:
+                arrival = max(prev_depart, open_t)
+                travel_str = "起点"
+            else:
+                travel = int(dists_m[i-1] / SPEED)
+                arrival = max(prev_depart + travel, open_t)
+                travel_str = f"🚗 {travel}min"
+
+            depart = min(arrival + visit, close_t)
+            actual_stay = max(depart - arrival, 0)  # 实际停留（可能被关门时间截断）
+
+            # 到达时已关门则跳过该 POI，但不影响后续时间计算
+            if actual_stay <= 0:
+                prev_depart = arrival  # 到达即离开，不消耗时间
+                continue
+
+            lines.append(
+                f"  {to_str(arrival)}-{to_str(depart)}  {name}  "
+                f"({travel_str} | 停留{actual_stay}min | 营业 {opens_str[i]}-{closes_str[i]})"
+            )
+            prev_depart = depart
+
+        lines.append(f"  🏁 {to_str(depart)} 行程结束")
+        return "\n".join(lines)
+
     def _build_day_context(self, day_order, day_idx):
         """为某天构建候选景点上下文"""
         context_parts = []
@@ -706,8 +958,9 @@ class TravelAgent:
             name = self.user_favorites.loc[poi_id, "name"]
             ctx = self.user_favorites.loc[poi_id, "context"]
             seq = i + 1
+            # 同时传递名称和描述，避免 LLM 猜错名字
             context_parts.append(
-                f'序号 {seq}: "{ctx.replace(chr(10), "")[:120]}"'
+                f'序号 {seq}: {name} —— "{ctx.replace(chr(10), "")[:120]}"'
             )
             if poi_id in must_see_set:
                 must_see_names.append(name)
@@ -864,16 +1117,19 @@ class TravelAgent:
             except (ValueError, IndexError):
                 pass
 
-            # 方案2：名称 key → 模糊匹配回 POI 库
+            # 方案2：名称 key → 模糊匹配，但只限于当天候选 POI（防止匹配到远处同名POI）
             from thefuzz import process as fz
-            all_names = self.user_favorites["name"].tolist()
+            # 当天候选 POI 的名称列表（按 day_order 顺序）
+            candidate_names = [self.user_favorites.loc[pid, "name"] for pid in day_order]
             matched = []
             for key in pois_dict.keys():
-                best, score = fz.extract(key, all_names, limit=1)[0]
+                best, score = fz.extract(key, candidate_names, limit=1)[0]
                 if score > 80:
-                    idx = all_names.index(best)
-                    if idx not in matched:
-                        matched.append(idx)
+                    # 找回原始 POI id
+                    idx_in_order = candidate_names.index(best)
+                    pid = day_order[idx_in_order]
+                    if pid not in matched:
+                        matched.append(pid)
             if matched:
                 return self.user_favorites.loc[matched]
 

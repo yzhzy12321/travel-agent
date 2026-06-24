@@ -31,6 +31,10 @@ def arg_parse(parser):
                         help='要排除的景点，逗号分隔（如"鼓山,西湖公园"），模糊匹配 POI 库')
     parser.add_argument('--serve', action='store_true', default=False,
                         help='生成后启动本地 HTTP 服务器（高德地图需从 http:// 访问）')
+    parser.add_argument('--start', type=str, default='08:00',
+                        help='每天出发时间 HH:MM（默认 08:00）')
+    parser.add_argument('--end', type=str, default='20:00',
+                        help='每天结束时间 HH:MM（默认 20:00）')
     return parser.parse_args()
 
 
@@ -56,7 +60,9 @@ def run(args) -> None:
         travel_date=args.date,
         citywalk=True,
         hotel=args.hotel,
-        exclude_pois=exclude_pois
+        exclude_pois=exclude_pois,
+        start_time=args.start,
+        end_time=args.end
     )
     result = planner.solve_multiday()
 
@@ -86,6 +92,10 @@ def run(args) -> None:
                     print(f"  {line.strip()}")
         if day.get('weather_note') and day['weather_note'] != '无':
             print(f"  🌤️ 天气提示: {day['weather_note']}")
+        # 时间线
+        tl = day.get('timeline', '')
+        if tl:
+            print(f"\n{tl}")
 
     # 高德地图需从 http:// 访问，提供一键启动本地服务器
     if args.serve:

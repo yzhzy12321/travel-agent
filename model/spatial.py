@@ -1,12 +1,7 @@
-import json
-import copy
-import scipy
-import openai
 import numpy as np
 import pandas as pd
 import networkx as nx
-import datetime
-import folium
+import scipy
 import requests
 from python_tsp.heuristics import solve_tsp_simulated_annealing
 from model.utils.funcs import get_max_summation_idx, get_top_k_sets, get_topk_location_pairs, find_clusters_containing_all_elements
@@ -15,12 +10,14 @@ from pulp import LpVariable, LpProblem, LpMinimize, value, lpSum, LpBinary, PULP
 
 
 class SpatialHandler:
-    def __init__(self, data, min_clusters, min_pois, citywalk=False, citywalk_thresh=5000):
+    def __init__(self, data, min_clusters, min_pois, citywalk=False, citywalk_thresh=5000, start_time="08:00"):
         self.data = data
         self.min_pois = min_pois
         self.min_clusters = min_clusters
         self.citywalk = citywalk
         self.citywalk_thresh = citywalk_thresh
+        self.start_time = start_time
+        self.poi_scores = {}   # {poi_id: quality_score}, 多目标优化用
         # 真实道路距离缓存: {(id1, id2): distance_m}
         self._road_dist_cache = {}
 
@@ -76,9 +73,8 @@ class SpatialHandler:
 
         all_clusters = []
         
-        if G.number_of_edges() == 0:
-            all_clusters = [[i for i in poi_idlist]]
-            return all_clusters
+        if G.number_of_edges() <= N:  # 只有自环，无真实连接（所有 POI 间距 > thresh）
+            return [poi_idlist]
         
         while G.number_of_nodes() > 0:    
             cliques = list(nx.find_cliques(G))
@@ -175,7 +171,7 @@ class SpatialHandler:
             return dist_matrix
 
         # 批量查询 OSRM
-        print(f"  🚗 OSRM 真实道路距离：查询 {len(pairs_to_query)} 对...", end=" ")
+        # print(f"  🚗 OSRM 道路距离：查询 {len(pairs_to_query)} 对...", end=" ")
         queried = 0
         failed = 0
         for i, j, key in pairs_to_query:
@@ -205,7 +201,7 @@ class SpatialHandler:
                 dist_matrix[i, j] = d_euclid * 1.4
                 dist_matrix[j, i] = d_euclid * 1.4
 
-        print(f"✅ {queried} 成功" + (f", {failed} 失败(已fallback)" if failed else ""))
+        # print(f"✅ {queried} 成功" + (f", {failed} 失败(已fallback)" if failed else ""))
         return dist_matrix
 
     def _fetch_osrm_distance(self, lon1, lat1, lon2, lat2) -> int | None:
@@ -220,6 +216,128 @@ class SpatialHandler:
         except Exception:
             pass
         return None
+
+    def _fix_time_windows(self, poi_idlist: list, order: list, dist_matrix: np.ndarray) -> list:
+        """
+        TSP 求解后，用贪心交换修正关门时间违规。
+
+        原理：从前往后检查，如果某 POI 到达时间晚于关门时间，
+        将其与后面一个更早关门的 POI 尝试交换，减少违规。
+
+        Args:
+            poi_idlist: POI ID 列表
+            order: TSP 产生的初始访问顺序 [2, 0, 1, 3, ...]
+            dist_matrix: 道路距离矩阵
+
+        Returns:
+            list: 修正后的访问顺序
+        """
+        n = len(order)
+        if n <= 2:
+            return order
+
+        try:
+            close_times = self.data.loc[poi_idlist]["close_time"].tolist()
+        except KeyError:
+            return order
+
+        def to_min(t_str):
+            parts = str(t_str).split(':')
+            return int(parts[0]) * 60 + int(parts[1])
+
+        closes = [to_min(c) for c in close_times]
+
+        def compute_arrivals(ord_seq):
+            """给定顺序，计算每个 POI 的到达时间"""
+            start_min = int(self.start_time.split(":")[0]) * 60 + int(self.start_time.split(":")[1])
+            arrivals = [start_min]
+            # 从数据读取首个 POI 的停留时长
+            try:
+                prev_visit = int(self.data.loc[poi_idlist[ord_seq[0]], "visittime"])
+            except (KeyError, ValueError):
+                prev_visit = 60
+            for k in range(1, len(ord_seq)):
+                i, j = ord_seq[k-1], ord_seq[k]
+                travel = int(dist_matrix[i, j] / 500.0)
+                arrivals.append(arrivals[-1] + prev_visit + travel)
+                # 从数据读取下个点的停留时长
+                try:
+                    prev_visit = int(self.data.loc[poi_idlist[j], "visittime"])
+                except (KeyError, ValueError):
+                    prev_visit = 60
+            return arrivals
+
+        # 检查违规
+        fixed = list(order)
+        for _ in range(10):  # 最多 10 轮贪心交换
+            arrivals = compute_arrivals(fixed)
+            violations = [(pos, fixed[pos]) for pos in range(n)
+                          if arrivals[pos] > closes[fixed[pos]]]
+            if not violations:
+                break
+
+            # 尝试把违规点往后移，和后面的点交换
+            pos, pid = violations[0]
+            for swap_pos in range(pos + 1, n):
+                new = list(fixed)
+                new[pos], new[swap_pos] = new[swap_pos], new[pos]
+                new_arrivals = compute_arrivals(new)
+                old_v = sum(1 for a, o in zip(arrivals, fixed) if a > closes[o])
+                new_v = sum(1 for a, o in zip(new_arrivals, new) if a > closes[o])
+                if new_v < old_v:
+                    fixed = new
+                    break
+            else:
+                break  # 无法改进
+
+        return fixed
+
+    def _apply_quality_bias(self, dist_matrix: np.ndarray, poi_idlist: list) -> np.ndarray:
+        """
+        在距离矩阵上叠加品质偏差：高分 POI 对其他点"引力更大"。
+
+        公式: effective_dist[i][j] = actual_dist[i][j] + λ × (1 - score_norm[j]) × mean_dist
+        其中 score_norm 归一化到 [0, 1]，高分 POI 让到达它的边更短。
+        """
+        from model.config import POI_QUALITY_WEIGHT
+
+        if POI_QUALITY_WEIGHT <= 0 or not self.poi_scores:
+            return dist_matrix
+
+        n = len(poi_idlist)
+        # 优先用真实 rating，没有则用搜索相似度，都没有则 0.5
+        scores = []
+        for i in range(n):
+            pid = poi_idlist[i]
+            try:
+                r = float(self.data.loc[pid, "rating"])
+                if pd.isna(r):
+                    raise ValueError
+                scores.append(r)
+            except (KeyError, ValueError, TypeError):
+                scores.append(self.poi_scores.get(pid, 0.5))
+        scores = np.array(scores)
+        s_min, s_max = scores.min(), scores.max()
+        if s_max - s_min < 1e-6:
+            return dist_matrix  # 分数都一样，无需调整
+
+        # 归一化到 [0, 1]
+        score_norm = (scores - s_min) / (s_max - s_min)
+        positive_dists = dist_matrix[dist_matrix > 0]
+        if len(positive_dists) == 0:
+            return dist_matrix  # 没有有效距离，跳过质量偏差
+        mean_dist = positive_dists.mean()
+
+        biased = dist_matrix.copy()
+        # 高分 POI 对周围点"引力更大"：到达它的边有效距离更短
+        for j in range(n):
+            discount = POI_QUALITY_WEIGHT * score_norm[j] * mean_dist
+            for i in range(n):
+                if i != j and biased[i, j] > discount:
+                    biased[i, j] -= discount
+                    biased[i, j] = max(biased[i, j], 0.5 * dist_matrix[i, j])  # 最多减半
+
+        return biased
 
     def get_tsp_order(self, poi_candidates_list: list = None, locs: list = None):
         """
@@ -252,12 +370,25 @@ class SpatialHandler:
             # fallback: 直线距离（聚类中心点或 OSRM 失败时）
             dist_matrix = scipy.spatial.distance.cdist(locs, locs)
 
+        # ---- 多目标优化：品质偏差（高分 POI 引力更大）----
+        if poi_candidates_list is not None and len(poi_candidates_list) >= 2:
+            dist_matrix = self._apply_quality_bias(dist_matrix, poi_candidates_list)
+
         if locs.shape[0] > 2:
             order, distance = solve_tsp_simulated_annealing(dist_matrix)
         elif locs.shape[0] == 2:
             order = [0, 1]
         else:
             order = [0]
+
+        # ---- 新：TSP 后时间窗修正 ----
+        if poi_candidates_list is not None and len(poi_candidates_list) >= 3:
+            fixed_order = self._fix_time_windows(
+                poi_candidates_list, list(order), dist_matrix
+            )
+            if len(fixed_order) == len(order):
+                order = fixed_order
+        # ---- 时间窗修正 END ----
 
         return np.array(order), locs, dist_matrix
     
@@ -454,44 +585,29 @@ class SpatialHandler:
             day_groups = self._balance_day_groups(day_groups, allpoi_idlist)
             return day_groups
 
-        # 聚类数 > 天数：合并邻近聚类
-        # 计算聚类中心
+        # 聚类数 > 天数：用 K-Means 对细粒度簇的质心分组（比贪心合并更能保持空间分离）
         centroids = self.get_cluster_centroids(fine_clusters)
         centroids_arr = np.array(centroids)
 
-        # 用贪心合并：每次合并距离最近的两个聚类
-        from itertools import combinations
-        cluster_sets = [set(c) for c in fine_clusters]
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=num_days, random_state=42, n_init=10)
+        day_labels = kmeans.fit_predict(centroids_arr)
 
-        while len(cluster_sets) > num_days:
-            # 找距离最近的两个聚类
-            min_dist = float('inf')
-            merge_pair = (0, 1)
-            for i, j in combinations(range(len(cluster_sets)), 2):
-                # 用两个聚类中最近 POI 对的距离作为聚类间距离
-                locs_i = self.data.loc[list(cluster_sets[i])][["x", "y"]].astype(float).to_numpy()
-                locs_j = self.data.loc[list(cluster_sets[j])][["x", "y"]].astype(float).to_numpy()
-                dist = np.min(scipy.spatial.distance.cdist(locs_i, locs_j))
-                if dist < min_dist:
-                    min_dist = dist
-                    merge_pair = (i, j)
+        # 将细粒度簇按 K-Means 标签归入各天
+        day_groups_raw = [[] for _ in range(num_days)]
+        for cluster_idx, label in enumerate(day_labels):
+            day_groups_raw[label].extend(fine_clusters[cluster_idx])
 
-            # 合并
-            i, j = merge_pair
-            cluster_sets[i] = cluster_sets[i] | cluster_sets[j]
-            cluster_sets.pop(j)
-
-        # 转换为列表，按 POI 数量降序排列
-        day_groups = [list(c) for c in cluster_sets]
-        day_groups.sort(key=len, reverse=True)
+        # 按 POI 数量降序排列（让内容最丰富的天排在前面）
+        day_groups_raw.sort(key=len, reverse=True)
 
         # 确保返回 num_days 个组
-        while len(day_groups) < num_days:
-            day_groups.append([])
+        while len(day_groups_raw) < num_days:
+            day_groups_raw.append([])
 
-        day_groups = self._balance_day_groups(day_groups, allpoi_idlist)
+        day_groups_raw = self._balance_day_groups(day_groups_raw, allpoi_idlist)
 
-        return day_groups
+        return day_groups_raw
 
     def _balance_day_groups(self,
                             day_groups: list[list],
