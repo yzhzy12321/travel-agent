@@ -41,50 +41,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== 数据完整性检查 ====================
-
-def _ensure_data_ready():
-    """确保 data 目录下 _zh.csv 和 _zh.npy 存在，缺失则从 raw 自动生成"""
-    data_dir = Path("model/data")
-    cities = ["fuzhou", "guangzhou", "shenzhen", "shanghai"]
-    missing = []
-    for c in cities:
-        if not (data_dir / f"{c}_zh.csv").exists() or not (data_dir / f"{c}_zh.npy").exists():
-            missing.append(c)
-    if not missing:
-        return
-
-    st.warning(f"⚠️ 缺失数据: {missing}，正在自动构建…")
-    try:
-        import subprocess, pandas as pd, numpy as np
-        for c in missing:
-            raw_csv = data_dir / f"{c}_raw.csv"
-            if not raw_csv.exists():
-                st.error(f"❌ 缺少原始数据: {raw_csv}")
-                continue
-            st.info(f"🔧 构建 {c} 数据集…")
-            # 用 conda env 下的 python，streamlit 的 sys.executable 可能指向不存在的 python3.10
-            py_path = os.path.dirname(sys.executable) + "/python"
-            if not os.path.exists(py_path):
-                py_path = sys.executable  # fallback
-            subprocess.run([
-                py_path, str(data_dir / "build_dataset.py"),
-                "--city", c, "--poi_file", str(raw_csv)
-            ], cwd=str(data_dir), check=True, timeout=300)
-
-            st.info(f"🔧 生成 {c} 嵌入向量…")
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
-            zh = pd.read_csv(data_dir / f"{c}_zh.csv")
-            embeddings = model.encode(zh["context"].fillna("").tolist(), show_progress_bar=False, normalize_embeddings=True)
-            np.save(str(data_dir / f"{c}_zh.npy"), embeddings)
-        st.success("✅ 数据构建完成！")
-        st.rerun()
-    except Exception as e:
-        st.error(f"❌ 构建失败: {e}\n请手动: cd model/data && python build_dataset.py")
-
-_ensure_data_ready()
-
 # ==================== Session State ====================
 
 for key, default in [
@@ -489,7 +445,7 @@ if st.session_state.get("view_mode") == "trip_detail" and st.session_state.trip_
     if ov and os.path.exists(ov):
         with st.expander("🗺️ 总览地图", expanded=True):
             with open(ov, "r", encoding="utf-8") as f:
-                st.components.v1.html(f.read(), height=500)
+                st.components.v1.html(f.read(), height=650, scrolling=True)
     day_maps = st.session_state.get("map_days", [])
     if day_maps:
         mtabs = st.tabs([f"Day {k+1} 地图" for k in range(len(day_maps))])
@@ -497,7 +453,7 @@ if st.session_state.get("view_mode") == "trip_detail" and st.session_state.trip_
             with mt:
                 if os.path.exists(mp):
                     with open(mp, "r", encoding="utf-8") as f:
-                        st.components.v1.html(f.read(), height=400)
+                        st.components.v1.html(f.read(), height=500, scrolling=True)
 
     st.stop()
 
@@ -557,7 +513,7 @@ for i, msg in enumerate(st.session_state.chat_history):
                 if ov and os.path.exists(ov):
                     with st.expander("🗺️ 总览地图", expanded=False):
                         with open(ov, "r", encoding="utf-8") as f:
-                            st.components.v1.html(f.read(), height=400)
+                            st.components.v1.html(f.read(), height=500, scrolling=True)
                 day_maps = st.session_state.get("map_days", [])
                 if day_maps:
                     mtabs = st.tabs([f"Day {k+1} 地图" for k in range(len(day_maps))])
@@ -565,7 +521,7 @@ for i, msg in enumerate(st.session_state.chat_history):
                         with mt:
                             if os.path.exists(mp):
                                 with open(mp, "r", encoding="utf-8") as f:
-                                    st.components.v1.html(f.read(), height=400)
+                                    st.components.v1.html(f.read(), height=500, scrolling=True)
 
     elif role in ("user", "assistant"):
         with st.chat_message(role):

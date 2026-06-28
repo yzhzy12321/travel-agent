@@ -178,9 +178,29 @@ def build_city_csv(city_name, poi_file, start_id=10001):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="数据集构建工具")
-    parser.add_argument("--city", type=str, required=True, help="城市名（拼音）")
-    parser.add_argument("--poi_file", type=str, required=True, help="原始 POI CSV 文件路径（相对于 data 目录或绝对路径）")
+    parser.add_argument("--city", type=str, default=None, help="城市名（拼音），不指定则配合 --all 构建全部")
+    parser.add_argument("--poi_file", type=str, default=None, help="原始 POI CSV 文件路径（相对于 data 目录或绝对路径）")
     parser.add_argument("--start_id", type=int, default=10001, help="起始 ID（默认 10001）")
+    parser.add_argument("--all", action="store_true", help="为所有已支持城市批量构建")
     args = parser.parse_args()
+
+    # 默认支持的城市（raw CSV 文件名 = {city}_raw.csv）
+    ALL_CITIES = ["fuzhou", "guangzhou", "shenzhen", "shanghai"]
+
+    if args.all or (args.city is None and args.poi_file is None):
+        print("🚀 批量构建所有城市数据集…\n")
+        for i, c in enumerate(ALL_CITIES):
+            raw = os.path.join(DATA_DIR, f"{c}_raw.csv")
+            if not os.path.exists(raw):
+                print(f"⚠️ 跳过 {c}: 缺少 {raw}")
+                continue
+            print(f"[{i+1}/{len(ALL_CITIES)}] 正在构建 {c}…")
+            build_city_csv(c, raw, args.start_id)
+            print()
+        print("✅ 全部完成！")
+        sys.exit(0)
+
+    if args.city is None or args.poi_file is None:
+        parser.error("请指定 --city 和 --poi_file，或使用 --all 构建全部城市")
 
     build_city_csv(args.city, args.poi_file, args.start_id)
