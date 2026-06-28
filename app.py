@@ -31,6 +31,56 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# 加宽侧边栏
+st.markdown("""
+<style>
+    [data-testid="stSidebar"] {
+        min-width: 380px;
+        max-width: 420px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ==================== 数据完整性检查 ====================
+
+def _ensure_data_ready():
+    """确保 data 目录下 _zh.csv 和 _zh.npy 存在，缺失则从 raw 自动生成"""
+    data_dir = Path("model/data")
+    cities = ["fuzhou", "guangzhou", "shenzhen", "shanghai"]
+    missing = []
+    for c in cities:
+        if not (data_dir / f"{c}_zh.csv").exists() or not (data_dir / f"{c}_zh.npy").exists():
+            missing.append(c)
+    if not missing:
+        return
+
+    st.warning(f"⚠️ 缺失数据: {missing}，正在自动构建…")
+    try:
+        import subprocess, pandas as pd, numpy as np
+        for c in missing:
+            raw_csv = data_dir / f"{c}_raw.csv"
+            if not raw_csv.exists():
+                st.error(f"❌ 缺少原始数据: {raw_csv}")
+                continue
+            st.info(f"🔧 构建 {c} 数据集…")
+            subprocess.run([
+                sys.executable, str(data_dir / "build_dataset.py"),
+                "--city", c, "--poi_file", str(raw_csv)
+            ], cwd=str(data_dir), check=True, timeout=300)
+
+            st.info(f"🔧 生成 {c} 嵌入向量…")
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+            zh = pd.read_csv(data_dir / f"{c}_zh.csv")
+            embeddings = model.encode(zh["context"].fillna("").tolist(), show_progress_bar=False, normalize_embeddings=True)
+            np.save(str(data_dir / f"{c}_zh.npy"), embeddings)
+        st.success("✅ 数据构建完成！")
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ 构建失败: {e}\n请手动: cd model/data && python build_dataset.py")
+
+_ensure_data_ready()
+
 # ==================== Session State ====================
 
 for key, default in [
