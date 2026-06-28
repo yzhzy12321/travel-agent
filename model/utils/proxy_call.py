@@ -4,10 +4,10 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from model.config import api_key,base_url
 class OpenaiCall:
-    def __init__(self):
+    def __init__(self, api_key: str = None, base_url: str = None):
         # Chat/LLM 调用使用 DeepSeek（兼容 OpenAI SDK）
-        deepseek_key = os.getenv("DEEPSEEK_API_KEY", api_key)
-        deepseek_base = os.getenv("DEEPSEEK_BASE_URL", base_url)
+        deepseek_key = api_key or os.getenv("DEEPSEEK_API_KEY") or globals().get("api_key", "")
+        deepseek_base = base_url or os.getenv("DEEPSEEK_BASE_URL") or globals().get("base_url", "")
         self.client = OpenAI(
             api_key=deepseek_key,
             base_url=deepseek_base

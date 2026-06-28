@@ -35,6 +35,8 @@ def arg_parse(parser):
                         help='每天出发时间 HH:MM（默认 08:00）')
     parser.add_argument('--end', type=str, default='20:00',
                         help='每天结束时间 HH:MM（默认 20:00）')
+    parser.add_argument('--verbose', action='store_true', default=True,
+                        help='显示 LLM 的思考过程（流式输出，调试/前端展示用）')
     return parser.parse_args()
 
 
@@ -62,7 +64,8 @@ def run(args) -> None:
         hotel=args.hotel,
         exclude_pois=exclude_pois,
         start_time=args.start,
-        end_time=args.end
+        end_time=args.end,
+        verbose=args.verbose
     )
     result = planner.solve_multiday()
 

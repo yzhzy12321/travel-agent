@@ -8,10 +8,6 @@ Travel Agent: 多日长行程 + RAG 时空感知旅游规划 Agent
   - 住宿点周边推荐
   - Folium 交互式地图可视化
 
-用法：
-    from model.agent import TravelAgent
-    planner = TravelAgent(user_reqs=["..."], city="shanghai", num_days=3, ...)
-    result = planner.solve_multiday()
 """
 
 import os
@@ -69,7 +65,9 @@ class TravelAgent:
                  hotel: Optional[str] = None,
                  exclude_pois: Optional[list] = None,
                  start_time: str = "08:00",
-                 end_time: str = "20:00"):
+                 end_time: str = "20:00",
+                 verbose: bool = False,
+                 model_override: Optional[str] = None):
         """
         初始化 Travel Agent
 
@@ -90,13 +88,16 @@ class TravelAgent:
             exclude_pois: 要排除的景点名称列表（模糊匹配 POI 库）
             start_time: 每天出发时间 "HH:MM"（默认 08:00）
             end_time: 每天结束时间 "HH:MM"（默认 20:00）
+            verbose: 是否显示 LLM 思考过程（调试用，配合 --verbose）
+            model_override: 覆盖默认 LLM 模型（None 则用 config.LLM_MODEL）
         """
-        self.MODEL = LLM_MODEL
+        self.MODEL = model_override or LLM_MODEL
         self.type = type
         self.proxy = proxy_call
         self.city = city
         self.city_zh = CITY_ZH_MAP.get(city, city)
         self.num_days = num_days
+        self.verbose = verbose
         self.citywalk = citywalk
         self.user_reqs = user_reqs
         self.start_time = start_time
@@ -595,37 +596,88 @@ class TravelAgent:
                            spatiotemporal_ctx, hours, max_pois, day_theme))
 
         # ---- 并行 LLM 调用：所有天同时请求 ----
+        # 流式输出加锁，防止多线程 stdout 交错
+        import sys
+        import threading
+        _print_lock = threading.Lock()
+
         def _gen_one_day(args):
             if args is None:
                 return None
             day_idx, day_order, context_string, must_see_string, \
                 spatiotemporal_ctx, hours, max_pois, day_theme = args
 
-            day_response = self._generate_day_plan(
-                day_index=day_idx,
-                context_string=context_string,
-                must_see_string=must_see_string,
-                spatiotemporal_context=spatiotemporal_ctx,
-                hours=hours,
-                max_pois=max_pois,
-                day_theme=day_theme
-            )
+            # ---- 流式输出思考（仅 verbose 模式） ----
+            if self.verbose:
+                with _print_lock:
+                    print(f"\n{'─'*50}")
+                    print(f"💭 Day {day_idx+1} LLM 思考过程（流式）:")
+                    print(f"{'─'*50}")
 
-            try:
-                day_data = json.loads(day_response)
-            except Exception:
+                def on_chunk(chunk_text):
+                    with _print_lock:
+                        sys.stdout.write(chunk_text)
+                        sys.stdout.flush()
+
+                day_response = self._generate_day_plan(
+                    day_index=day_idx,
+                    context_string=context_string,
+                    must_see_string=must_see_string,
+                    spatiotemporal_context=spatiotemporal_ctx,
+                    hours=hours,
+                    max_pois=max_pois,
+                    day_theme=day_theme,
+                    stream_callback=on_chunk
+                )
+                with _print_lock:
+                    print(f"\n{'─'*50}\n")
+
+                # 提取 JSON（流式输出的内容已实时打印）
+                reasoning_text, day_data = self._extract_json_and_reasoning(day_response)
+                if reasoning_text and "reasoning" not in (day_data or {}):
+                    if day_data:
+                        day_data["reasoning"] = reasoning_text
+                if day_data is None:
+                    try:
+                        day_data = json.loads(day_response)
+                    except Exception:
+                        try:
+                            day_data = json.loads(day_response[8:-4])
+                        except Exception:
+                            day_data = None
+            else:
+                reasoning_text = ""
+                day_response = self._generate_day_plan(
+                    day_index=day_idx,
+                    context_string=context_string,
+                    must_see_string=must_see_string,
+                    spatiotemporal_context=spatiotemporal_ctx,
+                    hours=hours,
+                    max_pois=max_pois,
+                    day_theme=day_theme
+                )
                 try:
-                    day_data = json.loads(day_response[8:-4])
+                    day_data = json.loads(day_response)
                 except Exception:
-                    day_data = {
-                        "day_theme": day_theme or f"第{day_idx+1}天",
-                        "itinerary": " -> ".join(
-                            self.user_favorites.loc[day_order[:max_pois]]["name"].tolist()
-                        ),
-                        "day_reason": "自动生成的行程",
-                        "weather_note": "无",
-                        "pois": {}
-                    }
+                    try:
+                        day_data = json.loads(day_response[8:-4])
+                    except Exception:
+                        day_data = None
+
+            if day_data is None:
+                day_data = {
+                    "day_theme": day_theme or f"第{day_idx+1}天",
+                    "itinerary": " -> ".join(
+                        self.user_favorites.loc[day_order[:max_pois]]["name"].tolist()
+                    ),
+                    "day_reason": "自动生成的行程",
+                    "weather_note": "无",
+                    "pois": {}
+                }
+
+            # 保留 LLM 返回的 reasoning 字段（如果有），否则用提取的文本
+            if reasoning_text and "reasoning" not in day_data:
+                day_data["reasoning"] = reasoning_text
 
             day_data["day"] = day_idx + 1
 
@@ -841,6 +893,63 @@ class TravelAgent:
 
     # ========== 辅助方法 ==========
 
+    @staticmethod
+    def _extract_json_and_reasoning(response: str):
+        """
+        从 LLM 响应中分离推理文本和 JSON。
+
+        策略：
+        1. 先尝试直接解析整个响应为 JSON
+        2. 否则找第一个 { 到最后一个 } 之间的内容作为 JSON
+        3. JSON 之前的内容作为推理文本
+
+        Returns:
+            tuple[str, dict | None]: (reasoning_text, parsed_json_dict)
+        """
+        if not response:
+            return "", None
+
+        # 方案 1：直接解析
+        try:
+            return "", json.loads(response)
+        except Exception:
+            pass
+
+        # 方案 2：括号平衡——逐字符计数 {} 找到真正的 JSON 闭合位置
+        first_brace = response.find('{')
+        if first_brace != -1:
+            reasoning = response[:first_brace].strip()
+            depth = 0
+            in_string = False
+            escape_next = False
+            for i in range(first_brace, len(response)):
+                ch = response[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == '\\':
+                    escape_next = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        json_str = response[first_brace:i + 1]
+                        try:
+                            return reasoning, json.loads(json_str)
+                        except Exception:
+                            pass
+                        break
+
+        # 方案 3：fallback——全部视为推理
+        return response, None
+
     def _build_timeline(self, day_data: dict, day_order: list, day_idx: int) -> str:
         """
         根据 LLM 精选路线、道路距离和时间窗，生成"几点到哪"时间线。
@@ -908,7 +1017,9 @@ class TravelAgent:
             return f"{h:02d}:{mi:02d}"
 
         START = int(self.start_time.split(":")[0]) * 60 + int(self.start_time.split(":")[1])
-        SPEED = 500     # m/min 城市车速
+        SPEED_CAR = 500      # m/min 城市车速（30km/h）
+        SPEED_WALK = 80      # m/min 步行速度（5km/h）
+        SPEED_BIKE = 250     # m/min 骑行速度（15km/h）
 
         lines = ["### 🕐 预计时间线"]
         prev_depart = START  # 上一站的实际离开时间，用实际停留（可能被关门截断）
@@ -927,9 +1038,18 @@ class TravelAgent:
                 arrival = max(prev_depart, open_t)
                 travel_str = "起点"
             else:
-                travel = int(dists_m[i-1] / SPEED)
+                d = dists_m[i-1]
+                # 根据距离自动选择交通方式：<500m步行，500-2000m骑行，>2000m驾车
+                if d < 500:
+                    travel = max(1, int(d / SPEED_WALK))
+                    travel_str = f"🚶 {travel}min"
+                elif d < 2000:
+                    travel = max(1, int(d / SPEED_BIKE))
+                    travel_str = f"🚲 {travel}min"
+                else:
+                    travel = max(1, int(d / SPEED_CAR))
+                    travel_str = f"🚗 {travel}min"
                 arrival = max(prev_depart + travel, open_t)
-                travel_str = f"🚗 {travel}min"
 
             depart = min(arrival + visit, close_t)
             actual_stay = max(depart - arrival, 0)  # 实际停留（可能被关门时间截断）
@@ -945,7 +1065,7 @@ class TravelAgent:
             )
             prev_depart = depart
 
-        lines.append(f"  🏁 {to_str(depart)} 行程结束")
+        lines.append(f"  🏁 {to_str(prev_depart)} 行程结束")
         return "\n".join(lines)
 
     def _build_day_context(self, day_order, day_idx):
@@ -1001,8 +1121,15 @@ class TravelAgent:
         return day_order
 
     def _generate_day_plan(self, day_index, context_string, must_see_string,
-                           spatiotemporal_context, hours, max_pois, day_theme):
-        """调用 LLM 生成某天行程"""
+                           spatiotemporal_context, hours, max_pois, day_theme,
+                           stream_callback=None):
+        """
+        调用 LLM 生成某天行程。
+
+        Args:
+            stream_callback: 可选回调函数 fn(chunk_text)，每收到一个 token 调用一次。
+                             用于流式输出思考过程到终端/前端。
+        """
         messages = [
             {"role": "system", "content": get_multiday_system_prompt(
                 num_days=self.num_days, max_pois_per_day=max_pois
@@ -1018,10 +1145,21 @@ class TravelAgent:
                 numCandidates=len(context_string.split("\n")),
                 spatiotemporal_context=spatiotemporal_context,
                 hours=hours,
-                day_theme=day_theme
+                day_theme=day_theme,
+                show_reasoning=self.verbose
             )}
         ]
-        return self.proxy.chat(messages=messages, model=self.MODEL, temperature=0)
+
+        if stream_callback is not None:
+            # 流式模式：逐 token 回调 + 收集完整响应
+            full_response = []
+            for chunk in self.proxy.stream_chat(messages, model=self.MODEL, temperature=0):
+                if chunk:
+                    stream_callback(chunk)
+                    full_response.append(chunk)
+            return "".join(full_response)
+        else:
+            return self.proxy.chat(messages=messages, model=self.MODEL, temperature=0)
 
     def _generate_overview(self, day_themes):
         """生成多日行程总览"""

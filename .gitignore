@@ -3,7 +3,8 @@ __pycache__/
 output
 model/data/*.npy
 model/data/*_zh.csv
-model/config.py
+model/api.py
+chat_history/
 *.pdf
 README.md
 LICENSE

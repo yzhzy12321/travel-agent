@@ -451,7 +451,8 @@ def get_multiday_dayplan_prompt(day_index, num_days,
                                  maxPoiNum, numCandidates,
                                  spatiotemporal_context="",
                                  comments="", hours=None,
-                                 day_theme=""):
+                                 day_theme="",
+                                 show_reasoning=False):
     """多日行程中某一天的规划提示"""
     
     if hours is None:
@@ -459,6 +460,21 @@ def get_multiday_dayplan_prompt(day_index, num_days,
 
     if len(comments) > 0:
         comments = f"- 备注: {comments}"
+
+    # ---- 思考过程开关 ----
+    if show_reasoning:
+        reasoning_field = """,
+        "reasoning": "你的完整推理过程（为什么选择这些景点、如何处理天气和时空约束、如何安排顺序，<200字）" """
+        reasoning_instruction = """
+    ### 🧠 思考过程要求
+    在填充 JSON 之前，请先在 `reasoning` 字段中写下你的**完整推理过程**（不超过200字）：
+    - 你如何根据天气条件筛选景点（雨天优先室内、高温避开中午户外）
+    - 你如何确保每天的景点数量合理（时间预算内不赶场）
+    - 你如何满足用户的偏好需求（历史文化、美食、休闲等）
+    这段思考过程会展示给用户，让他们了解 AI 为何推荐这个行程。"""
+    else:
+        reasoning_field = ""
+        reasoning_instruction = ""
 
     prompt = f"""
     你是我的人工智能助手，请为用户的 {num_days} 天行程设计第 {day_index+1} 天的计划。
@@ -488,7 +504,7 @@ def get_multiday_dayplan_prompt(day_index, num_days,
     - 时间: 少于 {hours} 小时
     - 景点数量: 选择 {maxPoiNum} 个左右的景点
     - 顺序: 必须按候选景点的序列号升序排列
-    
+    {reasoning_instruction}
     ---
     
     ## 输出格式
@@ -496,7 +512,7 @@ def get_multiday_dayplan_prompt(day_index, num_days,
         "day_theme": "当天行程主题（简洁，<15字）",
         "itinerary": "景点名称，以'->'分隔（名称必须与候选列表中完全一致）",
         "day_reason": "当天行程整体推荐理由（<50字）",
-        "weather_note": "根据天气给出的特别提示（如无则填'无'）",
+        "weather_note": "根据天气给出的特别提示（如无则填'无'）"{reasoning_field},
         "pois": {{
             "2": "景点描述及推荐理由",
             "5": "景点描述及推荐理由"
