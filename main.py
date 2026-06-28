@@ -41,6 +41,29 @@ def arg_parse(parser):
 
 
 def run(args) -> None:
+    # 数据完整性检查
+    from pathlib import Path
+    data_dir = Path("model/data")
+    zh_csv = data_dir / f"{args.city}_zh.csv"
+    zh_npy = data_dir / f"{args.city}_zh.npy"
+    if not zh_csv.exists() or not zh_npy.exists():
+        print(f"⚠️ {args.city} 数据缺失，尝试自动构建…")
+        import subprocess, sys
+        try:
+            subprocess.run([
+                sys.executable, str(data_dir / "build_dataset.py"),
+                "--city", args.city, "--poi_file", str(data_dir / f"{args.city}_raw.csv")
+            ], cwd=str(data_dir), check=True)
+            from sentence_transformers import SentenceTransformer
+            import pandas as pd, numpy as np
+            model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+            zh = pd.read_csv(zh_csv)
+            np.save(str(zh_npy), model.encode(zh["context"].fillna("").tolist(), normalize_embeddings=True))
+            print("✅ 数据构建完成")
+        except Exception as e:
+            print(f"❌ 构建失败: {e}\n请手动: cd model/data && python build_dataset.py")
+            return
+
     # 城市中文名映射（命令行用拼音，展示用中文）
     city_zh = {"shanghai": "上海", "guangzhou": "广州", "shenzhen": "深圳", "fuzhou": "福州"}.get(args.city, args.city)
     query = (f"我想在{city_zh}玩{args.days}天，"
