@@ -17,12 +17,14 @@
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 1. 安装依赖 & 构建数据
 
 ```bash
 conda create -n roam python=3.10 -y
 conda activate roam
 pip install -r requirements.txt
+
+cd model/data && python build_dataset.py && cd ../..
 ```
 
 ### 2. 配置 API Key
