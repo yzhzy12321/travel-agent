@@ -63,8 +63,12 @@ def _ensure_data_ready():
                 st.error(f"❌ 缺少原始数据: {raw_csv}")
                 continue
             st.info(f"🔧 构建 {c} 数据集…")
+            # 用 conda env 下的 python，streamlit 的 sys.executable 可能指向不存在的 python3.10
+            py_path = os.path.dirname(sys.executable) + "/python"
+            if not os.path.exists(py_path):
+                py_path = sys.executable  # fallback
             subprocess.run([
-                sys.executable, str(data_dir / "build_dataset.py"),
+                py_path, str(data_dir / "build_dataset.py"),
                 "--city", c, "--poi_file", str(raw_csv)
             ], cwd=str(data_dir), check=True, timeout=300)
 

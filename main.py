@@ -48,10 +48,13 @@ def run(args) -> None:
     zh_npy = data_dir / f"{args.city}_zh.npy"
     if not zh_csv.exists() or not zh_npy.exists():
         print(f"⚠️ {args.city} 数据缺失，尝试自动构建…")
-        import subprocess, sys
+        import subprocess, sys, os
         try:
+            py_path = os.path.dirname(sys.executable) + "/python"
+            if not os.path.exists(py_path):
+                py_path = sys.executable
             subprocess.run([
-                sys.executable, str(data_dir / "build_dataset.py"),
+                py_path, str(data_dir / "build_dataset.py"),
                 "--city", args.city, "--poi_file", str(data_dir / f"{args.city}_raw.csv")
             ], cwd=str(data_dir), check=True)
             from sentence_transformers import SentenceTransformer
