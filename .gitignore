@@ -5,7 +5,7 @@ model/data/*.npy
 model/data/*_zh.csv
 model/api.py
 chat_history/
-*.pdf
+model/*.pdf
 README.md
 LICENSE
 imgs
