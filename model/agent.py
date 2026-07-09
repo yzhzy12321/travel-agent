@@ -517,6 +517,9 @@ class TravelAgent:
         day_orders = self.spatial_handler.get_multiday_full_order(
             day_poi_candidates, day_clusters
         )
+        # 安全检查：截断到 num_days（防止聚类异常产生多余天数）
+        day_orders = day_orders[:self.num_days]
+        day_clusters = day_clusters[:self.num_days]
         # 保存供可视化和调试使用
         self._day_orders = day_orders
         self._day_clusters = day_clusters

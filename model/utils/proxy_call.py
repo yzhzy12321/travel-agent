@@ -24,13 +24,20 @@ class OpenaiCall:
         return response.choices[0].message.content
 
     def stream_chat(self, messages, model="deepseek-v4-flash", temperature=0):
+        """流式调用，返回 (reasoning_content, content) 元组"""
         for chunk in self.client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
             stream=True
         ):
-            yield chunk.choices[0].delta.content
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None) or ""
+            content = getattr(delta, "content", None) or ""
+            if reasoning or content:
+                yield (reasoning, content)
     
     def embedding(self, input_data):
         """使用本地 BAAI/bge-small-zh-v1.5 生成 embedding，返回 numpy 数组 (n, 512)"""

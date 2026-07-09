@@ -18,10 +18,30 @@ from model.utils.proxy_call import OpenaiCall
 from model.agent import TravelAgent
 
 
-def _stream_chat(proxy, messages: list, model: str):
-    for chunk in proxy.stream_chat(messages=messages, model=model):
-        if chunk:
-            yield chunk
+def _stream_assistant(proxy, messages: list, model: str):
+    """流式输出，返回 (reply_text, thinking_text)"""
+    think_expander = st.expander("🧠 深度思考", expanded=True)
+    think_placeholder = think_expander.empty()
+    reply_placeholder = st.empty()
+
+    thinking_parts = []
+    reply_parts = []
+
+    for item in proxy.stream_chat(messages=messages, model=model):
+        if isinstance(item, tuple):
+            reasoning, content = item
+        else:
+            reasoning, content = "", item or ""
+
+        if reasoning:
+            thinking_parts.append(reasoning)
+            think_placeholder.markdown("".join(thinking_parts))
+
+        if content:
+            reply_parts.append(content)
+            reply_placeholder.markdown("".join(reply_parts))
+
+    return "".join(reply_parts), "".join(thinking_parts)
 
 
 st.set_page_config(
@@ -525,6 +545,9 @@ for i, msg in enumerate(st.session_state.chat_history):
 
     elif role in ("user", "assistant"):
         with st.chat_message(role):
+            if role == "assistant" and msg.get("thinking"):
+                with st.expander("🧠 深度思考", expanded=False):
+                    st.markdown(msg["thinking"])
             st.markdown(msg["content"])
 
 # ── 聊天输入 ──
@@ -559,11 +582,11 @@ if question := st.chat_input("输入消息…"):
         try:
             proxy = OpenaiCall(api_key=ck, base_url=st.session_state.api_base)
             with st.chat_message("assistant"):
-                response = st.write_stream(_stream_chat(proxy, messages, st.session_state.llm_model))
-            if response:
-                st.session_state.chat_history.append({"role": "assistant", "content": response})
-            else:
-                st.session_state.chat_history.append({"role": "assistant", "content": "(空回复)"})
+                response, thinking = _stream_assistant(proxy, messages, st.session_state.llm_model)
+            msg = {"role": "assistant", "content": response or "(空回复)"}
+            if thinking:
+                msg["thinking"] = thinking
+            st.session_state.chat_history.append(msg)
         except Exception as e:
             st.session_state.chat_history.append({"role": "assistant", "content": f"❌ 调用失败: {e}"})
 

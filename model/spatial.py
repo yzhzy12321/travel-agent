@@ -607,7 +607,8 @@ class SpatialHandler:
 
         day_groups_raw = self._balance_day_groups(day_groups_raw, allpoi_idlist)
 
-        return day_groups_raw
+        # 最终安全截断：绝不超过 num_days
+        return day_groups_raw[:num_days]
 
     def _balance_day_groups(self,
                             day_groups: list[list],
