@@ -16,6 +16,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model.utils.proxy_call import OpenaiCall
 from model.agent import TravelAgent
+from model.config import CITY_ZH_MAP
+
+# 中文城市名 → 英文城市名 反向映射
+_CITY_ZH2EN = {v: k for k, v in CITY_ZH_MAP.items()}
+
+
+def _norm_city(city_val: str) -> str:
+    """将中文城市名转回英文名（兼容旧数据），如 '福州' → 'fuzhou'"""
+    return _CITY_ZH2EN.get(city_val, city_val)
 
 
 def _stream_assistant(proxy, messages: list, model: str):
@@ -65,11 +74,22 @@ st.markdown("""
 
 for key, default in [
     ("chat_history", []),
-    ("trip_result", None),
-    ("trip_in_chat_idx", None),
+    ("trip_result", None),    ("trip_planner", None),    ("trip_in_chat_idx", None),
     ("console_logs", []),
     ("llm_model", "deepseek-v4-flash"),
     ("api_base", "https://api.deepseek.com"),
+    # replan 状态机
+    ("_rp_active", False),
+    ("_rp_steps", []),
+    ("_rp_msgs", None),
+    ("_rp_replanner", None),
+    ("_rp_modified", False),
+    ("_rp_question", ""),
+    ("_rp_tools", None),
+    ("_rp_conversation", []),    # 上下文记忆：累积对话历史
+    ("map_overview", None),      # Folium 总览地图路径
+    ("map_days", []),            # Folium 每日地图路径列表
+    ("_show_map_inline", False), # 标记：在对话中内联展示地图
     ("api_key_input", ""),
     ("provider", "deepseek"),
     ("preset_idx", 0),
@@ -135,6 +155,141 @@ def _list_saved_chats():
         except Exception:
             pass
     return chats
+
+# ==================== Replan 状态机（渐进式 function calling） ====================
+
+if st.session_state._rp_active and st.session_state._rp_msgs is not None:
+    _s = st.session_state
+    rp = _s._rp_replanner
+    msgs = list(_s._rp_msgs)
+
+    try:
+        resp, reasoning = rp.agent.proxy.chat(msgs, model=rp.agent.MODEL, tools=_s._rp_tools)
+
+        if reasoning:
+            _s._rp_steps.append({"type": "reasoning", "content": reasoning})
+
+        if isinstance(resp, str):
+            # ── 最终回复：渲染完整答案 + 思考面板 ──
+            think_lines = []
+            for step in _s._rp_steps:
+                t = step.get("type")
+                if t == "reasoning":
+                    think_lines.append(f"\n💭 **思考**\n{step['content']}\n")
+                elif t == "text":
+                    think_lines.append(f"\n🗣️ {step['content']}\n")
+                elif t == "tool_call":
+                    name = step.get("name", "?")
+                    args = step.get("args", {})
+                    args_str = json.dumps(args, ensure_ascii=False)
+                    think_lines.append(f"\n🔧 **`{name}`**\n```json\n{args_str}\n```\n")
+                elif t == "tool_result":
+                    name = step.get("name", "?")
+                    content = step.get("content", "")
+                    think_lines.append(f"\n📋 **`{name}` 返回**\n```json\n{content}\n```\n")
+            thinking_md = "\n".join(think_lines) if think_lines else ""
+
+            _s.chat_history.append({
+                "role": "assistant",
+                "content": resp,
+                "thinking": thinking_md,
+            })
+            _s.trip_result = rp.result
+            # 重刷 transit / timeline / 地图等渲染内容
+            map_paths = rp.agent.refresh_trip_rendering(_s.trip_result)
+            if map_paths.get("map_overview"):
+                _s.map_overview = map_paths["map_overview"]
+            if map_paths.get("map_days"):
+                _s.map_days = map_paths["map_days"]
+                _s._show_map_inline = True
+            _save_chat()
+
+            # ── 保存对话历史供下一轮上下文记忆（过滤掉 tool 消息）──
+            conv = []
+            for m in _s._rp_msgs:
+                # 兼容 dict 和 ChatCompletionMessage 对象
+                if hasattr(m, 'role'):
+                    role = m.role
+                    content = getattr(m, 'content', '') or ''
+                    tool_calls = getattr(m, 'tool_calls', None)
+                else:
+                    role = m.get("role", "")
+                    content = m.get("content", "")
+                    tool_calls = m.get("tool_calls")
+                if role in ("tool", "system"):
+                    continue
+                if role == "assistant" and tool_calls:
+                    if content:
+                        conv.append({"role": "assistant", "content": content})
+                    continue
+                if role in ("user", "assistant"):
+                    conv.append({"role": role, "content": content})
+            conv.append({"role": "assistant", "content": resp})
+            _s._rp_conversation = conv[-20:]
+
+            for k in ("_rp_active", "_rp_steps", "_rp_msgs", "_rp_replanner",
+                      "_rp_modified", "_rp_question", "_rp_tools"):
+                if k in _s:
+                    del _s[k]
+            st.rerun()
+
+        else:
+            # ── 工具调用中：渲染实时进度，然后继续下一轮 ──
+            msg = resp
+            msgs.append(msg)
+
+            if hasattr(msg, 'content') and msg.content:
+                _s._rp_steps.append({"type": "text", "content": msg.content})
+
+            for tc in msg.tool_calls:
+                func_name = tc.function.name
+                args = json.loads(tc.function.arguments)
+                _s._rp_steps.append({"type": "tool_call", "name": func_name, "args": args})
+
+                if func_name in ("replace_poi", "remove_poi", "add_poi", "reroute_day", "add_day", "remove_day"):
+                    _s._rp_modified = True
+
+                tool_result = rp._call_tool(func_name, args)
+                preview = tool_result[:2000] if len(tool_result) > 2000 else tool_result
+                _s._rp_steps.append({"type": "tool_result", "name": func_name, "content": preview})
+
+                # show_map 需要即时更新地图到 session_state
+                if func_name == "show_map":
+                    map_paths = rp.agent.refresh_trip_rendering(rp.result)
+                    if map_paths.get("map_overview"):
+                        _s.map_overview = map_paths["map_overview"]
+                    if map_paths.get("map_days"):
+                        _s.map_days = map_paths["map_days"]
+                    _s._show_map_inline = True  # 标记：下一帧在对话中展示地图
+
+                msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
+
+            _s._rp_msgs = msgs
+
+            # ⚡ 在 rerun 之前先渲染实时进度（确保前端能看到）
+            with st.chat_message("assistant"):
+                with st.status(f"🤔 思考中…（{len(_s._rp_steps)} 步）", expanded=True) as _status:
+                    for step in _s._rp_steps:
+                        t = step.get("type")
+                        if t == "reasoning":
+                            st.markdown(f"💭 {step['content'][:200]}")
+                        elif t == "text":
+                            st.caption(f"🗣️ {step['content'][:200]}")
+                        elif t == "tool_call":
+                            st.markdown(f"🔧 **`{step.get('name','?')}`**")
+                        elif t == "tool_result":
+                            st.caption(f"📋 `{step.get('name','?')}` 完成")
+                    _status.update(label=f"🤔 思考中…（{len(_s._rp_steps)} 步）")
+
+            st.rerun()
+
+    except Exception as e:
+        _s.chat_history.append({"role": "assistant", "content": f"❌ 调用失败: {e}"})
+        for k in ("_rp_active", "_rp_steps", "_rp_msgs", "_rp_replanner",
+                  "_rp_modified", "_rp_question", "_rp_tools"):
+            if k in _s:
+                del _s[k]
+        st.rerun()
 
 # ==================== 侧边栏 ====================
 
@@ -213,6 +368,15 @@ with st.sidebar.expander("🔧 调试工具", expanded=False):
             st.session_state.trip_source = "debug"
             st.session_state.console_logs = [f"✅ 已加载(调试): {jf.name}"]
 
+            # 为 replan 创建轻量 agent（兼容新旧数据：city 可能是中文或英文）
+            city = _norm_city(trip.get("city", "fuzhou"))
+            num_days = len(trip.get("days", []))
+            proxy = OpenaiCall(api_key=st.session_state.api_key_input, base_url=st.session_state.api_base)
+            st.session_state.trip_planner = TravelAgent(
+                user_reqs=["debug"], city=city, num_days=num_days,
+                proxy_call=proxy, use_rag=False, model_override=st.session_state.llm_model
+            )
+
             # 匹配同名地图文件
             ts_prefix = jf.name.replace("_zh_multiday.json", "")
             output_dir = Path("model/output")
@@ -244,6 +408,12 @@ with st.sidebar.expander("🔧 调试工具", expanded=False):
 if st.session_state.trip_result and not st.session_state.show_planner:
     trip_title = st.session_state.trip_result.get("trip_title", "行程")
     debug_tag = " (调试)" if st.session_state.get("trip_source") == "debug" else ""
+
+    st.sidebar.info("💬 在下方聊天框自由对话：\n"
+                    "• \"把公园换成博物馆\" — 修改行程\n"
+                    "• \"给我看看时间线\" — 展示详情\n"
+                    "• \"第一天天气怎么样\" — 查询信息\n"
+                    "• 直接聊天也可以，我都会调用合适的工具")
 
     # 行程按钮 + 右侧菜单
     btn_col, menu_col = st.sidebar.columns([5, 1])
@@ -378,6 +548,7 @@ if st.session_state.show_planner:
                     st.session_state.console_logs = log_cap.getvalue().strip().split("\n")
                     st.session_state.trip_result = trip
                     st.session_state.trip_source = "generated"
+                    st.session_state.trip_planner = planner  # 保存 agent 给 replanner 用
 
                     # 匹配地图文件
                     output_dir = Path("model/output")
@@ -528,14 +699,15 @@ for i, msg in enumerate(st.session_state.chat_history):
                                         st.markdown(f"**{name}**")
                                         st.caption(str(desc)[:200])
 
-                # 地图
-                ov = st.session_state.get("map_overview")
-                if ov and os.path.exists(ov):
-                    with st.expander("🗺️ 总览地图", expanded=False):
-                        with open(ov, "r", encoding="utf-8") as f:
-                            st.components.v1.html(f.read(), height=500, scrolling=True)
+                # 地图：单日 → 总览地图（可折叠）；多日 → 分日标签页
                 day_maps = st.session_state.get("map_days", [])
-                if day_maps:
+                if len(day_maps) <= 1:
+                    ov = st.session_state.get("map_overview")
+                    if ov and os.path.exists(ov):
+                        with st.expander("🗺️ 总览地图", expanded=False):
+                            with open(ov, "r", encoding="utf-8") as f:
+                                st.components.v1.html(f.read(), height=500, scrolling=True)
+                else:
                     mtabs = st.tabs([f"Day {k+1} 地图" for k in range(len(day_maps))])
                     for k, (mt, mp) in enumerate(zip(mtabs, day_maps)):
                         with mt:
@@ -549,6 +721,27 @@ for i, msg in enumerate(st.session_state.chat_history):
                 with st.expander("🧠 深度思考", expanded=False):
                     st.markdown(msg["thinking"])
             st.markdown(msg["content"])
+
+# ── 内联地图：在所有对话之后、紧跟最后一条消息展示 ──
+if st.session_state.get("_show_map_inline"):
+    ov = st.session_state.get("map_overview")
+    day_maps = st.session_state.get("map_days", [])
+    # 地图：单日 → 总览地图；多日 → 分日标签页
+    if len(day_maps) <= 1:
+        if ov and os.path.exists(ov):
+            with st.chat_message("assistant"):
+                with st.expander("🗺️ 查看地图", expanded=True):
+                    with open(ov, "r", encoding="utf-8") as f:
+                        st.components.v1.html(f.read(), height=500, scrolling=True)
+    else:
+        with st.chat_message("assistant"):
+            mtabs = st.tabs([f"Day {k+1}" for k in range(len(day_maps))])
+            for k, (mt, mp) in enumerate(zip(mtabs, day_maps)):
+                with mt:
+                    if os.path.exists(mp):
+                        with open(mp, "r", encoding="utf-8") as f:
+                            st.components.v1.html(f.read(), height=500, scrolling=True)
+    st.session_state._show_map_inline = False
 
 # ── 聊天输入 ──
 if question := st.chat_input("输入消息…"):
@@ -580,13 +773,68 @@ if question := st.chat_input("输入消息…"):
                      for m in st.session_state.chat_history if m.get("role") in ("user", "assistant")]
 
         try:
-            proxy = OpenaiCall(api_key=ck, base_url=st.session_state.api_base)
-            with st.chat_message("assistant"):
-                response, thinking = _stream_assistant(proxy, messages, st.session_state.llm_model)
-            msg = {"role": "assistant", "content": response or "(空回复)"}
-            if thinking:
-                msg["thinking"] = thinking
-            st.session_state.chat_history.append(msg)
+            # ── 有行程时：初始化 replan 状态机，渐进式 function calling ──
+            if st.session_state.trip_result:
+                from model.replanner import Replanner, TOOLS as RP_TOOLS
+                output_dir = Path(__file__).resolve().parent / "model" / "output"
+                json_files = sorted(output_dir.glob("*_multiday.json"), key=os.path.getmtime, reverse=True)
+
+                agent = st.session_state.get("trip_planner")
+                # 如果 agent 的城市与当前行程城市不一致，需要重建
+                if agent is not None:
+                    trip_city = _norm_city(st.session_state.trip_result.get("city", "fuzhou"))
+                    if agent.city != trip_city:
+                        print(f"[chat] agent 城市({agent.city})与行程({trip_city})不一致，重建 agent")
+                        agent = None
+                        st.session_state.trip_planner = None
+                if agent is None:
+                    trip = st.session_state.trip_result
+                    city = _norm_city(trip.get("city", "fuzhou"))
+                    num_days = trip.get("num_days", len(trip.get("days", [])))
+                    proxy = OpenaiCall(api_key=ck, base_url=st.session_state.api_base)
+                    agent = TravelAgent(
+                        user_reqs=["chat"], city=city, num_days=num_days,
+                        proxy_call=proxy, use_rag=False, model_override=st.session_state.llm_model
+                    )
+                    st.session_state.trip_planner = agent
+
+                if json_files:
+                    json_path = str(json_files[0])
+                    rp = Replanner(agent, json_path)
+
+                    # 初始化状态机
+                    st.session_state._rp_active = True
+                    st.session_state._rp_steps = []
+                    st.session_state._rp_modified = False
+                    st.session_state._rp_replanner = rp
+                    st.session_state._rp_tools = RP_TOOLS
+                    st.session_state._rp_question = question
+
+                    # ── 上下文记忆：累积对话历史，LLM 能看到之前说过的话 ──
+                    sys_msg = {"role": "system", "content": rp._SYSTEM_PROMPT}
+                    user_msg = {"role": "user",
+                                "content": f"当前行程:\n{json.dumps(rp.result.get('days', []), ensure_ascii=False, indent=2)}\n\n用户请求: {question}"}
+                    prev_conv = st.session_state.get("_rp_conversation", [])
+                    if prev_conv:
+                        # 继续之前的对话
+                        st.session_state._rp_msgs = [sys_msg] + prev_conv + [user_msg]
+                    else:
+                        st.session_state._rp_msgs = [sys_msg, user_msg]
+                    st.rerun()  # 下一帧开始逐步执行 function calling
+                else:
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": "❌ 未找到行程 JSON 文件，请先生成初始行程"
+                    })
+            else:
+                # 无行程时：普通流式对话
+                proxy = OpenaiCall(api_key=ck, base_url=st.session_state.api_base)
+                with st.chat_message("assistant"):
+                    response, thinking = _stream_assistant(proxy, messages, st.session_state.llm_model)
+                msg = {"role": "assistant", "content": response or "(空回复)"}
+                if thinking:
+                    msg["thinking"] = thinking
+                st.session_state.chat_history.append(msg)
         except Exception as e:
             st.session_state.chat_history.append({"role": "assistant", "content": f"❌ 调用失败: {e}"})
 

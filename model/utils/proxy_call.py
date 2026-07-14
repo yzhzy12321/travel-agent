@@ -15,13 +15,27 @@ class OpenaiCall:
         # Embedding 使用本地 sentence-transformers 模型（无需 API）
         self.embedding_model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
 
-    def chat(self, messages, model="deepseek-v4-flash", temperature=0):
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature
-        )
-        return response.choices[0].message.content
+    def chat(self, messages, model="deepseek-v4-flash", temperature=0,
+             tools=None, tool_choice=None):
+        """对话，支持 tools/function calling。
+        返回:
+          - 如果有 tool_calls → (Message对象, reasoning_content)
+          - 否则 → (content_str, reasoning_content)
+        """
+        kwargs = dict(model=model, messages=messages, temperature=temperature)
+        if tools:
+            kwargs["tools"] = tools
+            if tool_choice:
+                kwargs["tool_choice"] = tool_choice
+        response = self.client.chat.completions.create(**kwargs)
+        if not response.choices:
+            raise RuntimeError("LLM API 返回空响应（choices 为空），请检查 API Key 和网络连接")
+        msg = response.choices[0].message
+        reasoning = getattr(msg, 'reasoning_content', '') or ''
+
+        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+            return msg, reasoning
+        return msg.content, reasoning
 
     def stream_chat(self, messages, model="deepseek-v4-flash", temperature=0):
         """流式调用，返回 (reasoning_content, content) 元组"""

@@ -104,7 +104,6 @@ def run(args) -> None:
     if args.serve:
         import http.server
         import socketserver
-        import threading
         import webbrowser
         PORT = 8899
         os.chdir("./model/output")
@@ -116,7 +115,6 @@ def run(args) -> None:
             print(f"   按 Ctrl+C 停止服务器")
             webbrowser.open(url)
             httpd.serve_forever()
-
 
 if __name__ == '__main__':
     args = arg_parse(argparse.ArgumentParser())
