@@ -15,6 +15,7 @@ try:
         MINIMAX_API_KEY,   MINIMAX_BASE_URL,
         STEPFUN_API_KEY,   STEPFUN_BASE_URL,
         GEMINI_API_KEY,    GEMINI_BASE_URL,
+        BAILIAN_API_KEY,   BAILIAN_BASE_URL,
         GaodeMap_apikey,
     )
 except ImportError:
@@ -25,6 +26,7 @@ except ImportError:
     MINIMAX_API_KEY   = MINIMAX_BASE_URL   = ""
     STEPFUN_API_KEY   = STEPFUN_BASE_URL   = ""
     GEMINI_API_KEY    = GEMINI_BASE_URL    = ""
+    BAILIAN_API_KEY   = BAILIAN_BASE_URL   = ""
     
     GaodeMap_apikey = "5e22fd9c5a1925afd65b15f27cba862f"
 

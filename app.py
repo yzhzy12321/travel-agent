@@ -308,6 +308,13 @@ with st.sidebar.expander("🔑 API 配置", expanded=True):
         "MiniMax-abab6.5s": {"model":"abab6.5s-chat","base_url":"https://api.minimax.chat/v1","provider":"minimax"},
         "阶跃星辰 Step-2": {"model":"step-2-16k","base_url":"https://api.stepfun.com/v1","provider":"stepfun"},
         "Gemini 2.0 Flash": {"model":"gemini-2.0-flash","base_url":"https://generativelanguage.googleapis.com/v1beta/openai","provider":"gemini"},
+        "Qwen3.7-Plus（百炼）": {"model":"qwen3.7-plus","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
+        "Qwen3.7-Max（百炼）": {"model":"qwen3.7-max","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
+        "Qwen-Flash（百炼）": {"model":"qwen-flash","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
+        "DeepSeek V4 Flash（百炼）": {"model":"deepseek-v4-flash","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
+        "Kimi K2.7（百炼）": {"model":"kimi-k2.7-code","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
+        "GLM-5.2（百炼）": {"model":"glm-5.2","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
+        "MiniMax M3（百炼）": {"model":"MiniMax-M3","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
         "🛠️ 自定义…": {"model":"","base_url":"","provider":"custom"},
     }
     names = list(MODEL_PRESETS.keys())
@@ -523,10 +530,11 @@ if st.session_state.show_planner:
             el = [x.strip() for x in exclude.split(",") if x.strip()] if exclude else None
 
             import os as _os
-            from model.config import DEEPSEEK_API_KEY,OPENAI_API_KEY,ANTHROPIC_API_KEY,MINIMAX_API_KEY,STEPFUN_API_KEY,GEMINI_API_KEY
+            from model.config import DEEPSEEK_API_KEY,OPENAI_API_KEY,ANTHROPIC_API_KEY,MINIMAX_API_KEY,STEPFUN_API_KEY,GEMINI_API_KEY,BAILIAN_API_KEY
             KEYS = {"deepseek":(DEEPSEEK_API_KEY,"DEEPSEEK_API_KEY"),"openai":(OPENAI_API_KEY,"OPENAI_API_KEY"),
                     "anthropic":(ANTHROPIC_API_KEY,"ANTHROPIC_API_KEY"),"minimax":(MINIMAX_API_KEY,"MINIMAX_API_KEY"),
-                    "stepfun":(STEPFUN_API_KEY,"STEPFUN_API_KEY"),"gemini":(GEMINI_API_KEY,"GEMINI_API_KEY")}
+                    "stepfun":(STEPFUN_API_KEY,"STEPFUN_API_KEY"),"gemini":(GEMINI_API_KEY,"GEMINI_API_KEY"),
+                    "bailian":(BAILIAN_API_KEY,"BAILIAN_API_KEY")}
             fk = st.session_state.api_key_input
             if not fk and st.session_state.provider in KEYS:
                 cfg_key, env_name = KEYS[st.session_state.provider]
@@ -755,7 +763,8 @@ if question := st.chat_input("输入消息…"):
     )
     KC = {"deepseek": DEEPSEEK_API_KEY, "openai": OPENAI_API_KEY,
           "anthropic": ANTHROPIC_API_KEY, "minimax": MINIMAX_API_KEY,
-          "stepfun": STEPFUN_API_KEY, "gemini": GEMINI_API_KEY}
+          "stepfun": STEPFUN_API_KEY, "gemini": GEMINI_API_KEY,
+          "bailian": BAILIAN_API_KEY}
     ck = st.session_state.api_key_input or KC.get(st.session_state.provider, "")
 
     if not ck:
