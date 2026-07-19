@@ -544,14 +544,16 @@ def get_multiday_dayplan_prompt(day_index, num_days,
     return prompt
 
 
-def get_multiday_overview_prompt(num_days, day_themes, user_reqs):
+def get_multiday_overview_prompt(num_days, day_themes, user_reqs, city_zh="", city=""):
     """生成多日行程总览的提示"""
     themes_str = "\n".join(f"  Day {i+1}: {t}" for i, t in enumerate(day_themes))
+    city_info = f"{city_zh}({city})" if city_zh else "目的地"
     
     prompt = f"""
     你是我的人工智能助手，请为用户的多日行程生成一个总览介绍。
     
     ### 行程概况
+    - 目的地: {city_info}
     - 天数: {num_days}
     - 每日主题:
     {themes_str}
@@ -559,7 +561,7 @@ def get_multiday_overview_prompt(num_days, day_themes, user_reqs):
     
     ### 输出格式
     {{
-        "trip_title": "行程总标题（<20字）",
+        "trip_title": "行程总标题（<20字，必须包含目的地名称 {city_zh}）",
         "trip_overview": "行程总览介绍（<100字），概括多日行程的叙事线和亮点",
         "daily_summary": [
             {{"day": 1, "title": "日标题", "one_liner": "一句话亮点（<30字）"}},

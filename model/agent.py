@@ -67,7 +67,8 @@ class TravelAgent:
                  start_time: str = "08:00",
                  end_time: str = "20:00",
                  verbose: bool = False,
-                 model_override: Optional[str] = None):
+                 model_override: Optional[str] = None,
+                 output_dir: str = "./model/output"):
         """
         初始化 Travel Agent
 
@@ -108,6 +109,7 @@ class TravelAgent:
         self.thresh = thresh
         self.min_poi_candidate_num = min_poi_candidate_num
         self.use_rag = use_rag
+        self.output_dir = output_dir
         self.hotel_name = hotel
         self.exclude_poi_names = exclude_pois or []
 
@@ -1380,7 +1382,9 @@ class TravelAgent:
             msg = [{"role": "user", "content": get_multiday_overview_prompt(
                 num_days=self.num_days,
                 day_themes=day_themes,
-                user_reqs=self.user_reqs
+                user_reqs=self.user_reqs,
+                city_zh=self.city_zh,
+                city=self.city
             )}]
             response, _ = self.proxy.chat(messages=msg, model=self.MODEL)
             response = response.replace("'", '"')
@@ -1398,8 +1402,8 @@ class TravelAgent:
     def _save_result(self, result):
         """保存结果到 JSON 文件"""
         current_time = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
-        filename = f"./model/output/{current_time}_{self.type}_multiday.json"
-        os.makedirs("./model/output", exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
+        filename = os.path.join(self.output_dir, f"{current_time}_{self.type}_multiday.json")
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         print(f"\n✅ 多日行程已保存至: {filename}")
@@ -1451,7 +1455,7 @@ class TravelAgent:
                         opacity=0.3
                     ).add_to(m)
 
-            m.save(f'./model/output/{map_filename}')
+            m.save(os.path.join(self.output_dir, map_filename))
             return m
 
         # ---- 辅助：从 LLM 响应中提取实际选中的 POI ----
@@ -1583,7 +1587,7 @@ class TravelAgent:
 
             if all_lats:
                 m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
-            m.save(f'./model/output/{current_time}_{self.type}_overview.html')
+            m.save(os.path.join(self.output_dir, f'{current_time}_{self.type}_overview.html'))
 
             print(f"🗺️  地图已保存: {current_time}_{self.type}_day*.html + _overview.html ({self.num_days+1} 张)")
 

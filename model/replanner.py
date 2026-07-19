@@ -747,9 +747,11 @@ class Replanner:
         """
         steps = []
         modified = False
+        city_zh = self.result.get("city_zh", "")
+        city = self.result.get("city", "")
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"当前行程:\n{json.dumps(self.result.get('days', []), ensure_ascii=False, indent=2)}\n\n用户请求: {user_input}"}
+            {"role": "system", "content": SYSTEM_PROMPT + f"\n\n📍 当前城市: {city_zh} ({city})。所有搜索和添加景点操作仅限于此城市。"},
+            {"role": "user", "content": f"当前行程 ({city_zh}):\n{json.dumps(self.result.get('days', []), ensure_ascii=False, indent=2)}\n\n用户请求: {user_input}"}
         ]
 
         def _emit(step: dict):

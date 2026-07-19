@@ -3,8 +3,8 @@ ROAM 评估指标计算模块
 ======================================
 用于对比实验（ROAM vs LLM-Only）和消融实验的定量评估。
 
-指标列表:
-  RC  — Route Compactness (路线紧凑度, 米, ↓)
+指标列表（11个）:
+  RC  — Route Compactness (路线紧凑度, 米/段, ↓)
   CR  — Time Compliance Rate (时间合规率, %, ↑)
   SM  — Semantic Matching (语义匹配度, cos, ↑)
   HR  — Hallucination Rate (幻觉率, %, ↓)
@@ -13,6 +13,8 @@ ROAM 评估指标计算模块
   TT  — Total Transit Ratio (通勤占比, %, ↓)
   AR  — Avg Rating (平均景点评分, 1-5分, ↑)
   PC  — Preference Coverage (偏好覆盖率, %, ↑)
+  CE  — City Exploration (城市探索率, %, ↑)
+  POI — POI Count (景点总数, 个, —)
 
 用法:
     from model.eval.metrics import ItineraryEvaluator
@@ -86,9 +88,15 @@ def _parse_timeline_entry(line: str):
 def _parse_transit_summary(transit_text: str):
     """
     从交通摘要中提取总距离和通勤时间。
-    返回: {"total_dist_m": float, "walk_m": float, "bike_m": float, "car_m": float, "cost": float}
+    返回: {"total_dist_m": float, "walk_m": float, "bike_m": float, "car_m": float, "cost": float, "weighted_dist_m": float}
+
+    weighted_dist_m 使用时间归一化加权：
+      - 步行 80m/min → 权重 1.0（基准）
+      - 骑行 250m/min → 权重 80/250 ≈ 0.32
+      - 驾车 500m/min → 权重 80/500 ≈ 0.16
+    含义：以"步行等效距离"衡量紧凑度——骑行1km等效步行320m，驾车1km等效步行160m。
     """
-    result = {"total_dist_m": 0, "walk_m": 0, "bike_m": 0, "car_m": 0, "cost": 0}
+    result = {"total_dist_m": 0, "walk_m": 0, "bike_m": 0, "car_m": 0, "cost": 0, "weighted_dist_m": 0}
     if not transit_text:
         return result
 
@@ -112,6 +120,10 @@ def _parse_transit_summary(transit_text: str):
     m = re.search(r'预估总花费:\s*([\d.]+)元', transit_text)
     if m:
         result["cost"] = float(m.group(1))
+
+    # 加权等效距离 = 步行×1.0 + 骑行×0.32 + 驾车×0.16
+    result["weighted_dist_m"] = round(
+        result["walk_m"] * 1.0 + result["bike_m"] * 0.32 + result["car_m"] * 0.16, 1)
 
     return result
 
@@ -138,8 +150,15 @@ class ItineraryEvaluator:
         self.city = city
         self.type = type
 
+        # 城市名标准化：中文名 → 拼音（兼容两种输入）
+        CITY_ZH2PINYIN = {
+            "福州": "fuzhou", "广州": "guangzhou",
+            "深圳": "shenzhen", "上海": "shanghai",
+        }
+        city_pinyin = CITY_ZH2PINYIN.get(city, city)
+
         # 加载 POI 数据库
-        data_path = os.path.join("model", "data", f"{city}_{type}.csv")
+        data_path = os.path.join("model", "data", f"{city_pinyin}_{type}.csv")
         self.data = pd.read_csv(data_path)
         self.name_to_idx = _name_to_idx(self.data)
         self.all_names = list(self.name_to_idx.keys())
@@ -163,24 +182,36 @@ class ItineraryEvaluator:
 
     def compute_route_compactness(self, trip_result: dict) -> float:
         """
-        RC — 路线紧凑度（米，↓）
-        计算行程中每日总通勤距离的均值。
-        从 transit_summary 中提取道路距离；若无则用直线距离估算。
+        RC — 路线紧凑度（加权步行等效米/段，↓）
+        使用时间归一化加权距离：
+          - 步行 1m = 1m 等效（基准）
+          - 骑行 1m ≈ 0.32m 等效
+          - 驾车 1m ≈ 0.16m 等效
+        总加权距离 / (总POI数 - 天数)，即平均每段路线的"步行等效长度"。
+        驾车为主的行程不会被误判为松散，步行为主的行程能得到合理的紧凑度。
         """
-        daily_dists = []
+        total_dist = 0.0
+        total_pois = 0
+        num_days = 0
         for day in trip_result.get("days", []):
             transit = day.get("transit_summary", "")
             parsed = _parse_transit_summary(transit)
-            if parsed["total_dist_m"] > 0:
-                daily_dists.append(parsed["total_dist_m"])
+            # 优先用加权等效距离，fallback 到总距离，再 fallback 到估算
+            if parsed["weighted_dist_m"] > 0:
+                total_dist += parsed["weighted_dist_m"]
+            elif parsed["total_dist_m"] > 0:
+                total_dist += parsed["total_dist_m"]
             else:
-                # fallback: 从 itinerary 计算直线距离
-                dist = self._estimate_day_distance(day)
-                daily_dists.append(dist)
+                total_dist += self._estimate_day_distance(day)
+            n = len([x for x in day.get("itinerary", "").split("->") if x.strip()])
+            total_pois += n
+            if n > 0:
+                num_days += 1
 
-        if not daily_dists:
+        segments = total_pois - num_days  # 路线段数 = POI数 - 天数
+        if segments <= 0:
             return 0.0
-        return float(np.mean(daily_dists))
+        return round(total_dist / segments, 1)
 
     def compute_time_compliance_rate(self, trip_result: dict) -> float:
         """
@@ -297,11 +328,11 @@ class ItineraryEvaluator:
             return 0.0
         return round(float(std_c / mean_c), 3)
 
-    def compute_weather_adaptation(self, trip_result: dict) -> float:
+    def compute_weather_adaptation(self, trip_result: dict, user_query: str = "") -> float:
         """
         WA — 天气适配率（%，↑）
-        雨天场景下，所选景点中室内/半室内类别占比。
-        非雨天返回 100（不适用）。
+        检测 query 是否为天气敏感场景（雨天/周一），若是则计算室内 POI 占比或非博物馆占比。
+        非天气敏感 query 返回 100（不适用）。
         """
         indoor_categories = {
             "博物馆/纪念馆", "文化艺术", "购物商圈", "美食街区",
@@ -311,21 +342,19 @@ class ItineraryEvaluator:
             "自然风光", "城市公园", "建筑地标", "历史街区",
             "海滨沙滩", "历史遗迹", "特色村落",
         }
+        monday_close_categories = {
+            "博物馆/纪念馆",
+        }
 
-        # 检查是否为雨天（从天气上下文字段）
-        is_rainy = False
-        for day in trip_result.get("days", []):
-            wc = day.get("weather_context", "")
-            if "雨" in wc:
-                is_rainy = True
-                break
-        # 也检查 rag_context
-        rag = trip_result.get("rag_context", "")
-        if "雨" in rag:
-            is_rainy = True
+        # 仅检测雨天场景（周一闭馆无数据支持，不做判断）
+        is_rain_query = False
+        if user_query:
+            if "雨" in user_query or "室内" in user_query:
+                is_rain_query = True
 
-        if not is_rainy:
-            return 100.0  # 非雨天不适用此指标
+        # 非雨天内 query → 不适用
+        if not is_rain_query:
+            return 100.0
 
         indoor_count = 0
         outdoor_count = 0
@@ -347,7 +376,6 @@ class ItineraryEvaluator:
                     indoor_count += 1
                 elif cat in outdoor_categories:
                     outdoor_count += 1
-                # 未归类的不计入
 
         total = indoor_count + outdoor_count
         if total == 0:
@@ -479,11 +507,60 @@ class ItineraryEvaluator:
 
         return round(covered / len(detected_prefs) * 100, 1)
 
+    def compute_city_exploration(self, trip_result: dict) -> float:
+        """
+        CE — 城市探索率（%，↑）
+        行程 POI 覆盖范围 / 城市全部 POI 覆盖范围 × 100%。
+        用凸包面积衡量，越大说明探索越广。
+        """
+        from scipy.spatial import ConvexHull
+
+        # 收集行程中所有 POI 的坐标
+        trip_lons, trip_lats = [], []
+        for day in trip_result.get("days", []):
+            itinerary = day.get("itinerary", "")
+            for name in itinerary.split(" -> "):
+                name = name.strip()
+                if not name:
+                    continue
+                matched = _fuzzy_match(name, self.all_names)
+                if not matched and name in self.name_to_idx:
+                    matched = name
+                if not matched:
+                    continue
+                idx = self.name_to_idx[matched]
+                trip_lons.append(float(self.data.loc[idx, "lon"]))
+                trip_lats.append(float(self.data.loc[idx, "lat"]))
+
+        if len(trip_lons) < 3:
+            return 0.0
+
+        # 城市全部 POI 凸包面积（缓存）
+        if not hasattr(self, '_city_hull_area'):
+            all_lons = self.data["lon"].astype(float).values
+            all_lats = self.data["lat"].astype(float).values
+            pts_all = np.column_stack([all_lons, all_lats])
+            try:
+                self._city_hull_area = ConvexHull(pts_all).volume  # 2D hull "volume" = area
+            except Exception:
+                self._city_hull_area = 1.0  # fallback
+
+        # 行程 POI 凸包面积
+        pts_trip = np.column_stack([trip_lons, trip_lats])
+        try:
+            trip_area = ConvexHull(pts_trip).volume
+        except Exception:
+            return 0.0
+
+        if self._city_hull_area <= 0:
+            return 0.0
+        return round(trip_area / self._city_hull_area * 100, 1)
+
     # ==================== 综合计算 ====================
 
     def compute_all(self, trip_result: dict, user_query: str = "") -> dict:
         """
-        计算全部 9 个指标，返回字典。
+        计算全部 10 个指标，返回字典。
         """
         return {
             "RC": self.compute_route_compactness(trip_result),
@@ -491,11 +568,18 @@ class ItineraryEvaluator:
             "SM": self.compute_semantic_matching(trip_result, user_query),
             "HR": self.compute_hallucination_rate(trip_result),
             "DB": self.compute_day_balance(trip_result),
-            "WA": self.compute_weather_adaptation(trip_result),
+            "WA": self.compute_weather_adaptation(trip_result, user_query),
             "TT": self.compute_transit_ratio(trip_result),
             "AR": self.compute_avg_rating(trip_result),
             "PC": self.compute_preference_coverage(trip_result, user_query),
+            "CE": self.compute_city_exploration(trip_result),
+            "POI": self._count_pois(trip_result),
         }
+
+    def _count_pois(self, trip_result: dict) -> int:
+        """统计总 POI 数"""
+        return sum(len([x for x in d.get("itinerary", "").split("->") if x.strip()])
+                   for d in trip_result.get("days", []))
 
     def compare(self,
                 result_a: dict, label_a: str,
@@ -514,17 +598,14 @@ class ItineraryEvaluator:
 
     def format_table(self, metrics: dict, label: str = "") -> str:
         """单组指标 → 格式化表格字符串"""
-        arrows = {
-            "RC": "↓", "CR": "↑", "SM": "↑", "HR": "↓",
-            "DB": "↓", "WA": "↑", "TT": "↓", "AR": "↑", "PC": "↑",
-        }
-        units = {
-            "RC": "m", "CR": "%", "SM": "cos", "HR": "%",
-            "DB": "CV", "WA": "%", "TT": "%", "AR": "分", "PC": "%",
-        }
+        keys = ["RC", "CR", "SM", "HR", "DB", "WA", "TT", "AR", "PC", "CE", "POI"]
+        arrows = {"RC": "↓", "CR": "↑", "SM": "↑", "HR": "↓", "DB": "↓",
+                  "WA": "↑", "TT": "↓", "AR": "↑", "PC": "↑", "CE": "↑", "POI": "↑"}
+        units = {"RC": "m", "CR": "%", "SM": "cos", "HR": "%", "DB": "CV",
+                 "WA": "%", "TT": "%", "AR": "分", "PC": "%", "CE": "%", "POI": "个"}
         header = f"  {label:<20}" if label else f"  {'指标':<12} {'值':>10} {'方向':>4} {'单位':>6}"
         lines = [header, "  " + "-" * 50]
-        for key in ["RC", "CR", "SM", "HR", "DB", "WA", "TT", "AR", "PC"]:
+        for key in keys:
             val = metrics.get(key, "-")
             if isinstance(val, float):
                 if key in ("SM", "DB"):
@@ -551,8 +632,10 @@ class ItineraryEvaluator:
             f"  {'指标':<6} {la:>12} {lb:>12} {'Δ':>10} {'方向':>4}",
             "  " + "-" * 50,
         ]
-        arrows = {"RC": "↓", "CR": "↑", "SM": "↑", "HR": "↓", "DB": "↓", "WA": "↑", "TT": "↓", "AR": "↑", "PC": "↑"}
-        for key in ["RC", "CR", "SM", "HR", "DB", "WA", "TT", "AR", "PC"]:
+        keys = ["RC", "CR", "SM", "HR", "DB", "WA", "TT", "AR", "PC", "CE", "POI"]
+        arrows = {"RC": "↓", "CR": "↑", "SM": "↑", "HR": "↓", "DB": "↓",
+                  "WA": "↑", "TT": "↓", "AR": "↑", "PC": "↑", "CE": "↑", "POI": "↑"}
+        for key in keys:
             a = ma.get(key, "-")
             b = mb.get(key, "-")
             d = delta.get(key, "-")

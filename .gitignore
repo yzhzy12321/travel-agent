@@ -9,3 +9,8 @@ model/*.pdf
 README.md
 LICENSE
 imgs
+pk
+bare
+baseline
+model/eval/ablation.py
+model/eval/batch*

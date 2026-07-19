@@ -16,26 +16,37 @@ class OpenaiCall:
         self.embedding_model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
 
     def chat(self, messages, model="deepseek-v4-flash", temperature=0,
-             tools=None, tool_choice=None):
-        """对话，支持 tools/function calling。
+             tools=None, tool_choice=None, timeout=300, max_retries=2):
+        """对话，支持 tools/function calling，带超时重试。
         返回:
           - 如果有 tool_calls → (Message对象, reasoning_content)
           - 否则 → (content_str, reasoning_content)
         """
+        import time
         kwargs = dict(model=model, messages=messages, temperature=temperature)
         if tools:
             kwargs["tools"] = tools
             if tool_choice:
                 kwargs["tool_choice"] = tool_choice
-        response = self.client.chat.completions.create(**kwargs)
-        if not response.choices:
-            raise RuntimeError("LLM API 返回空响应（choices 为空），请检查 API Key 和网络连接")
-        msg = response.choices[0].message
-        reasoning = getattr(msg, 'reasoning_content', '') or ''
 
-        if hasattr(msg, 'tool_calls') and msg.tool_calls:
-            return msg, reasoning
-        return msg.content, reasoning
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(**kwargs, timeout=timeout)
+                if not response.choices:
+                    raise RuntimeError("LLM API 返回空响应")
+                msg = response.choices[0].message
+                reasoning = getattr(msg, 'reasoning_content', '') or ''
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    return msg, reasoning
+                return msg.content, reasoning
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    wait = 5 * (attempt + 1)
+                    print(f"  ⚠️ 超时/错误，{wait}s后重试({attempt+1}/{max_retries})...")
+                    time.sleep(wait)
+        raise last_error
 
     def stream_chat(self, messages, model="deepseek-v4-flash", temperature=0):
         """流式调用，返回 (reasoning_content, content) 元组"""
