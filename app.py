@@ -87,6 +87,7 @@ for key, default in [
     ("_rp_question", ""),
     ("_rp_tools", None),
     ("_rp_conversation", []),    # 上下文记忆：累积对话历史
+    ("_rp_progress", None),      # 当前进度数据（{steps, count}），用于在聊天区底部渲染
     ("map_overview", None),      # Folium 总览地图路径
     ("map_days", []),            # Folium 每日地图路径列表
     ("_show_map_inline", False), # 标记：在对话中内联展示地图
@@ -160,140 +161,66 @@ def _list_saved_chats():
             pass
     return chats
 
-# ==================== Replan 状态机（渐进式 function calling） ====================
 
-if st.session_state._rp_active and st.session_state._rp_msgs is not None:
-    _s = st.session_state
-    rp = _s._rp_replanner
-    msgs = list(_s._rp_msgs)
+def _match_map_files(folder: Path, prefix: str = ""):
+    """扫描文件夹中的 HTML 地图文件，返回 (map_overview, map_days)
 
-    try:
-        resp, reasoning = rp.agent.proxy.chat(msgs, model=rp.agent.MODEL, tools=_s._rp_tools)
+    Args:
+        folder: 包含 HTML 地图文件的文件夹
+        prefix: 文件名前缀过滤（如时间戳前缀），为空则匹配所有
+    """
+    if not folder.exists():
+        return None, []
+    all_html = sorted(folder.glob("*.html"), key=os.path.getmtime, reverse=True)
+    map_overview = None
+    map_days = []
+    for hf in all_html:
+        if prefix and not hf.name.startswith(prefix):
+            continue
+        if "_overview" in hf.name:
+            map_overview = str(hf)
+        elif "_day" in hf.name:
+            map_days.append(str(hf))
+        elif "_fulltsp" not in hf.name and "_response_clusters" not in hf.name:
+            map_days.append(str(hf))
+    map_days.sort()
+    return map_overview, map_days
 
-        if reasoning:
-            _s._rp_steps.append({"type": "reasoning", "content": reasoning})
 
-        if isinstance(resp, str):
-            # ── 最终回复：渲染完整答案 + 思考面板 ──
-            think_lines = []
-            for step in _s._rp_steps:
-                t = step.get("type")
-                if t == "reasoning":
-                    think_lines.append(f"\n💭 **思考**\n{step['content']}\n")
-                elif t == "text":
-                    think_lines.append(f"\n🗣️ {step['content']}\n")
-                elif t == "tool_call":
-                    name = step.get("name", "?")
-                    args = step.get("args", {})
-                    args_str = json.dumps(args, ensure_ascii=False)
-                    think_lines.append(f"\n🔧 **`{name}`**\n```json\n{args_str}\n```\n")
-                elif t == "tool_result":
-                    name = step.get("name", "?")
-                    content = step.get("content", "")
-                    think_lines.append(f"\n📋 **`{name}` 返回**\n```json\n{content}\n```\n")
-            thinking_md = "\n".join(think_lines) if think_lines else ""
+def _render_map_section(map_overview, map_days, height=500, expanded=False, use_chat_wrapper=False):
+    """统一的地图渲染组件：单日/无 overview 时用 day_maps[0] 兜底，多日用分日标签页"""
+    # 确定实际可用的地图文件
+    ov_ok = map_overview and os.path.exists(map_overview)
+    day_maps_ok = [mp for mp in (map_days or []) if os.path.exists(mp)]
 
-            _s.chat_history.append({
-                "role": "assistant",
-                "content": resp,
-                "thinking": thinking_md,
-            })
-            _s.trip_result = rp.result
-            # 重刷 transit / timeline / 地图等渲染内容
-            map_paths = rp.agent.refresh_trip_rendering(_s.trip_result)
-            if map_paths.get("map_overview"):
-                _s.map_overview = map_paths["map_overview"]
-            if map_paths.get("map_days"):
-                _s.map_days = map_paths["map_days"]
-                _s._show_map_inline = True
-            _save_chat()
-
-            # ── 保存对话历史供下一轮上下文记忆（过滤掉 tool 消息）──
-            conv = []
-            for m in _s._rp_msgs:
-                # 兼容 dict 和 ChatCompletionMessage 对象
-                if hasattr(m, 'role'):
-                    role = m.role
-                    content = getattr(m, 'content', '') or ''
-                    tool_calls = getattr(m, 'tool_calls', None)
-                else:
-                    role = m.get("role", "")
-                    content = m.get("content", "")
-                    tool_calls = m.get("tool_calls")
-                if role in ("tool", "system"):
-                    continue
-                if role == "assistant" and tool_calls:
-                    if content:
-                        conv.append({"role": "assistant", "content": content})
-                    continue
-                if role in ("user", "assistant"):
-                    conv.append({"role": role, "content": content})
-            conv.append({"role": "assistant", "content": resp})
-            _s._rp_conversation = conv[-20:]
-
-            for k in ("_rp_active", "_rp_steps", "_rp_msgs", "_rp_replanner",
-                      "_rp_modified", "_rp_question", "_rp_tools"):
-                if k in _s:
-                    del _s[k]
-            st.rerun()
-
-        else:
-            # ── 工具调用中：渲染实时进度，然后继续下一轮 ──
-            msg = resp
-            msgs.append(msg)
-
-            if hasattr(msg, 'content') and msg.content:
-                _s._rp_steps.append({"type": "text", "content": msg.content})
-
-            for tc in msg.tool_calls:
-                func_name = tc.function.name
-                args = json.loads(tc.function.arguments)
-                _s._rp_steps.append({"type": "tool_call", "name": func_name, "args": args})
-
-                if func_name in ("replace_poi", "remove_poi", "add_poi", "reroute_day", "add_day", "remove_day"):
-                    _s._rp_modified = True
-
-                tool_result = rp._call_tool(func_name, args)
-                preview = tool_result[:2000] if len(tool_result) > 2000 else tool_result
-                _s._rp_steps.append({"type": "tool_result", "name": func_name, "content": preview})
-
-                # show_map 需要即时更新地图到 session_state
-                if func_name == "show_map":
-                    map_paths = rp.agent.refresh_trip_rendering(rp.result)
-                    if map_paths.get("map_overview"):
-                        _s.map_overview = map_paths["map_overview"]
-                    if map_paths.get("map_days"):
-                        _s.map_days = map_paths["map_days"]
-                    _s._show_map_inline = True  # 标记：下一帧在对话中展示地图
-
-                msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
-
-            _s._rp_msgs = msgs
-
-            # ⚡ 在 rerun 之前先渲染实时进度（确保前端能看到）
+    if len(day_maps_ok) <= 1:
+        # 单日或无分日地图：优先 overview，回退到 day_maps[0]
+        map_file = map_overview if ov_ok else (day_maps_ok[0] if day_maps_ok else None)
+        if map_file and os.path.exists(map_file):
+            if use_chat_wrapper:
+                with st.chat_message("assistant"):
+                    with st.expander("🗺️ 查看地图", expanded=expanded):
+                        with open(map_file, "r", encoding="utf-8") as f:
+                            st.components.v1.html(f.read(), height=height, scrolling=True)
+            else:
+                with st.expander("🗺️ 总览地图", expanded=expanded):
+                    with open(map_file, "r", encoding="utf-8") as f:
+                        st.components.v1.html(f.read(), height=height, scrolling=True)
+    else:
+        # 多日：分日标签页
+        if use_chat_wrapper:
             with st.chat_message("assistant"):
-                with st.status(f"🤔 思考中…（{len(_s._rp_steps)} 步）", expanded=True) as _status:
-                    for step in _s._rp_steps:
-                        t = step.get("type")
-                        if t == "reasoning":
-                            st.markdown(f"💭 {step['content'][:200]}")
-                        elif t == "text":
-                            st.caption(f"🗣️ {step['content'][:200]}")
-                        elif t == "tool_call":
-                            st.markdown(f"🔧 **`{step.get('name','?')}`**")
-                        elif t == "tool_result":
-                            st.caption(f"📋 `{step.get('name','?')}` 完成")
-                    _status.update(label=f"🤔 思考中…（{len(_s._rp_steps)} 步）")
-
-            st.rerun()
-
-    except Exception as e:
-        _s.chat_history.append({"role": "assistant", "content": f"❌ 调用失败: {e}"})
-        for k in ("_rp_active", "_rp_steps", "_rp_msgs", "_rp_replanner",
-                  "_rp_modified", "_rp_question", "_rp_tools"):
-            if k in _s:
-                del _s[k]
-        st.rerun()
+                mtabs = st.tabs([f"Day {k+1}" for k in range(len(day_maps_ok))])
+                for k, (mt, mp) in enumerate(zip(mtabs, day_maps_ok)):
+                    with mt:
+                        with open(mp, "r", encoding="utf-8") as f:
+                            st.components.v1.html(f.read(), height=height, scrolling=True)
+        else:
+            mtabs = st.tabs([f"Day {k+1} 地图" for k in range(len(day_maps_ok))])
+            for k, (mt, mp) in enumerate(zip(mtabs, day_maps_ok)):
+                with mt:
+                    with open(mp, "r", encoding="utf-8") as f:
+                        st.components.v1.html(f.read(), height=height, scrolling=True)
 
 # ==================== 侧边栏 ====================
 
@@ -354,6 +281,10 @@ with st.sidebar.expander("💾 对话记录", expanded=False):
                     st.session_state.current_chat_id = chat["id"]
                     st.session_state.console_logs = [f"✅ 已恢复对话: {chat['title']}"]
                     st.session_state.view_mode = "chat"
+                    # 恢复地图文件路径
+                    ov, dm = _match_map_files(CHAT_DIR / chat["id"])
+                    st.session_state.map_overview = ov
+                    st.session_state.map_days = dm
                     # 清除旧 replan 上下文，避免串到其他行程
                     st.session_state._rp_conversation = []
                     st.session_state._rp_active = False
@@ -393,18 +324,9 @@ with st.sidebar.expander("🔧 调试工具", expanded=False):
 
             # 匹配同名地图文件
             ts_prefix = jf.name.replace("_zh_multiday.json", "")
-            output_dir = Path("model/output")
-            all_html = sorted(output_dir.glob(f"{ts_prefix}*.html"), key=os.path.getmtime, reverse=True)
-            st.session_state.map_overview = None
-            st.session_state.map_days = []
-            for hf in all_html:
-                if "_overview" in hf.name:
-                    st.session_state.map_overview = str(hf)
-                elif "_day" in hf.name:
-                    st.session_state.map_days.append(str(hf))
-                elif "_fulltsp" not in hf.name and "_response_clusters" not in hf.name:
-                    st.session_state.map_days.append(str(hf))
-            st.session_state.map_days.sort()
+            ov, dm = _match_map_files(Path("model/output"), prefix=ts_prefix)
+            st.session_state.map_overview = ov
+            st.session_state.map_days = dm
             trip_card = {
                 "role": "trip",
                 "title": trip.get("trip_title", "行程"),
@@ -577,20 +499,9 @@ if st.session_state.show_planner:
                     st.session_state._rp_active = False
 
                     # 匹配地图文件（现在在 chat_folder 里）
-                    all_html = sorted(chat_folder.glob("*.html"), key=os.path.getmtime, reverse=True)
-                    st.session_state.map_overview = None
-                    st.session_state.map_days = []
-                    for hf in all_html:
-                        if hf.name.startswith(ts_before[:13]):
-                            if "_overview" in hf.name:
-                                st.session_state.map_overview = str(hf)
-                            elif "_day" in hf.name:
-                                st.session_state.map_days.append(str(hf))
-                            elif "_fulltsp" not in hf.name and "_response_clusters" not in hf.name:
-                                # 单日地图（如 2026_06_28_14_22_zh.html）
-                                st.session_state.map_days.append(str(hf))
-                    # 单日地图排序
-                    st.session_state.map_days.sort()
+                    ov, dm = _match_map_files(chat_folder, prefix=ts_before[:13])
+                    st.session_state.map_overview = ov
+                    st.session_state.map_days = dm
 
                     # 将规划结果卡片插入聊天历史
                     trip_card = {
@@ -657,19 +568,11 @@ if st.session_state.get("view_mode") == "trip_detail" and st.session_state.trip_
                             st.caption(str(desc)[:200])
 
     # 地图
-    ov = st.session_state.get("map_overview")
-    if ov and os.path.exists(ov):
-        with st.expander("🗺️ 总览地图", expanded=True):
-            with open(ov, "r", encoding="utf-8") as f:
-                st.components.v1.html(f.read(), height=650, scrolling=True)
-    day_maps = st.session_state.get("map_days", [])
-    if day_maps:
-        mtabs = st.tabs([f"Day {k+1} 地图" for k in range(len(day_maps))])
-        for k, (mt, mp) in enumerate(zip(mtabs, day_maps)):
-            with mt:
-                if os.path.exists(mp):
-                    with open(mp, "r", encoding="utf-8") as f:
-                        st.components.v1.html(f.read(), height=500, scrolling=True)
+    _render_map_section(
+        st.session_state.get("map_overview"),
+        st.session_state.get("map_days", []),
+        height=650, expanded=True,
+    )
 
     st.stop()
 
@@ -724,21 +627,12 @@ for i, msg in enumerate(st.session_state.chat_history):
                                         st.markdown(f"**{name}**")
                                         st.caption(str(desc)[:200])
 
-                # 地图：单日 → 总览地图（可折叠）；多日 → 分日标签页
-                day_maps = st.session_state.get("map_days", [])
-                if len(day_maps) <= 1:
-                    ov = st.session_state.get("map_overview")
-                    if ov and os.path.exists(ov):
-                        with st.expander("🗺️ 总览地图", expanded=False):
-                            with open(ov, "r", encoding="utf-8") as f:
-                                st.components.v1.html(f.read(), height=500, scrolling=True)
-                else:
-                    mtabs = st.tabs([f"Day {k+1} 地图" for k in range(len(day_maps))])
-                    for k, (mt, mp) in enumerate(zip(mtabs, day_maps)):
-                        with mt:
-                            if os.path.exists(mp):
-                                with open(mp, "r", encoding="utf-8") as f:
-                                    st.components.v1.html(f.read(), height=500, scrolling=True)
+                # 地图：单日或无 overview 时回退到 day_maps[0]；多日分日标签页
+                _render_map_section(
+                    st.session_state.get("map_overview"),
+                    st.session_state.get("map_days", []),
+                    height=500, expanded=False,
+                )
 
     elif role in ("user", "assistant"):
         with st.chat_message(role):
@@ -749,23 +643,11 @@ for i, msg in enumerate(st.session_state.chat_history):
 
 # ── 内联地图：在所有对话之后、紧跟最后一条消息展示 ──
 if st.session_state.get("_show_map_inline"):
-    ov = st.session_state.get("map_overview")
-    day_maps = st.session_state.get("map_days", [])
-    # 地图：单日 → 总览地图；多日 → 分日标签页
-    if len(day_maps) <= 1:
-        if ov and os.path.exists(ov):
-            with st.chat_message("assistant"):
-                with st.expander("🗺️ 查看地图", expanded=True):
-                    with open(ov, "r", encoding="utf-8") as f:
-                        st.components.v1.html(f.read(), height=500, scrolling=True)
-    else:
-        with st.chat_message("assistant"):
-            mtabs = st.tabs([f"Day {k+1}" for k in range(len(day_maps))])
-            for k, (mt, mp) in enumerate(zip(mtabs, day_maps)):
-                with mt:
-                    if os.path.exists(mp):
-                        with open(mp, "r", encoding="utf-8") as f:
-                            st.components.v1.html(f.read(), height=500, scrolling=True)
+    _render_map_section(
+        st.session_state.get("map_overview"),
+        st.session_state.get("map_days", []),
+        height=500, expanded=True, use_chat_wrapper=True,
+    )
     st.session_state._show_map_inline = False
 
 # ── 聊天输入 ──
@@ -800,24 +682,19 @@ if question := st.chat_input("输入消息…"):
                      for m in st.session_state.chat_history if m.get("role") in ("user", "assistant")]
 
         try:
-            # ── 有行程时：初始化 replan 状态机，渐进式 function calling ──
+            # ── 有行程时：内联流式 function calling ──
             if st.session_state.trip_result:
                 from model.replanner import Replanner, TOOLS as RP_TOOLS
-                # 从当前对话文件夹加载，确保是当前行程而非旧 model/output/
                 chat_folder = CHAT_DIR / (st.session_state.current_chat_id or "chat")
                 chat_folder.mkdir(parents=True, exist_ok=True)
                 trip_json_path = chat_folder / "trip.json"
-                # 始终写入当前 trip_result，确保与用户看到的行程一致
                 with open(trip_json_path, "w", encoding="utf-8") as f:
                     json.dump(st.session_state.trip_result, f, ensure_ascii=False, indent=2)
-                json_files = [trip_json_path]
 
                 agent = st.session_state.get("trip_planner")
-                # 如果 agent 的城市与当前行程城市不一致，需要重建
                 if agent is not None:
                     trip_city = _norm_city(st.session_state.trip_result.get("city", "fuzhou"))
                     if agent.city != trip_city:
-                        print(f"[chat] agent 城市({agent.city})与行程({trip_city})不一致，重建 agent")
                         agent = None
                         st.session_state.trip_planner = None
                 if agent is None:
@@ -828,38 +705,186 @@ if question := st.chat_input("输入消息…"):
                     agent = TravelAgent(
                         user_reqs=["chat"], city=city, num_days=num_days,
                         proxy_call=proxy, use_rag=False, model_override=st.session_state.llm_model,
-                        output_dir=str(CHAT_DIR / (st.session_state.current_chat_id or "chat"))
+                        output_dir=str(chat_folder)
                     )
                     st.session_state.trip_planner = agent
 
-                if json_files:
-                    json_path = str(json_files[0])
-                    rp = Replanner(agent, json_path)
+                rp = Replanner(agent, str(trip_json_path))
+                proxy = agent.proxy  # 从 agent 获取，避免第二次对话时未定义
 
-                    # 初始化状态机
-                    st.session_state._rp_active = True
-                    st.session_state._rp_steps = []
-                    st.session_state._rp_modified = False
-                    st.session_state._rp_replanner = rp
-                    st.session_state._rp_tools = RP_TOOLS
-                    st.session_state._rp_question = question
-
-                    # ── 上下文记忆：累积对话历史，LLM 能看到之前说过的话 ──
-                    sys_msg = {"role": "system", "content": rp._SYSTEM_PROMPT}
-                    user_msg = {"role": "user",
-                                "content": f"当前行程:\n{json.dumps(rp.result.get('days', []), ensure_ascii=False, indent=2)}\n\n用户请求: {question}"}
-                    prev_conv = st.session_state.get("_rp_conversation", [])
-                    if prev_conv:
-                        # 继续之前的对话
-                        st.session_state._rp_msgs = [sys_msg] + prev_conv + [user_msg]
-                    else:
-                        st.session_state._rp_msgs = [sys_msg, user_msg]
-                    st.rerun()  # 下一帧开始逐步执行 function calling
+                # ── 上下文记忆 ──
+                sys_msg = {"role": "system", "content": rp._SYSTEM_PROMPT}
+                user_msg = {"role": "user",
+                            "content": f"当前行程:\n{json.dumps(rp.result.get('days', []), ensure_ascii=False, indent=2)}\n\n用户请求: {question}"}
+                prev_conv = st.session_state.get("_rp_conversation", [])
+                if prev_conv:
+                    msgs = [sys_msg] + prev_conv + [user_msg]
                 else:
+                    msgs = [sys_msg, user_msg]
+
+                # ── 流式容器 ──
+                with st.chat_message("assistant"):
+                    think_exp = st.expander("🧠 深度思考", expanded=True)
+                    think_ph = think_exp.empty()
+                    reply_ph = st.empty()
+                    status_ph = st.empty()
+
+                    all_reasoning_parts = []
+                    all_reply_parts = []
+                    modified = False
+                    max_turns = 12
+                    final_text = None
+
+                    for turn in range(max_turns):
+                        # 流式调用 LLM
+                        turn_reasoning = []
+                        turn_content = []
+                        tool_calls_from_stream = None
+
+                        stream_events = proxy.stream_chat_with_tools(
+                            messages=msgs,
+                            model=st.session_state.llm_model,
+                            tools=RP_TOOLS,
+                        )
+                        for event in stream_events:
+                            if event["type"] == "reasoning":
+                                turn_reasoning.append(event["content"])
+                                all_reasoning_parts.append(event["content"])
+                                think_ph.markdown("".join(all_reasoning_parts))
+                            elif event["type"] == "content":
+                                turn_content.append(event["content"])
+                                all_reply_parts.append(event["content"])
+                                reply_ph.markdown("".join(all_reply_parts))
+                            elif event["type"] == "done":
+                                if event.get("tool_calls"):
+                                    tool_calls_from_stream = event["tool_calls"]
+                                    if event.get("reasoning"):
+                                        all_reasoning_parts.append(event["reasoning"])
+                                elif event.get("final_text"):
+                                    final_text = event["final_text"]
+                                    if event.get("reasoning"):
+                                        all_reasoning_parts.append(event["reasoning"])
+                                break
+
+                        # ── 无 tool_calls → 最终回复 ──
+                        if tool_calls_from_stream is None:
+                            final_text = final_text or "".join(all_reply_parts)
+                            break
+
+                        # ── 有 tool_calls → 执行并继续 ──
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": "".join(turn_content) if turn_content else None,
+                            "tool_calls": [
+                                {
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["function"]["name"],
+                                        "arguments": tc["function"]["arguments"],
+                                    }
+                                }
+                                for tc in tool_calls_from_stream
+                            ]
+                        }
+                        msgs.append(assistant_msg)
+
+                        for tc in tool_calls_from_stream:
+                            func_name = tc["function"]["name"]
+                            try:
+                                args = json.loads(tc["function"]["arguments"])
+                            except Exception:
+                                args = {}
+
+                            # ── 记录工具调用到思考面板 ──
+                            args_str = json.dumps(args, ensure_ascii=False)
+                            all_reasoning_parts.append(f"\n\n🔧 **`{func_name}`**\n```json\n{args_str}\n```\n")
+                            think_ph.markdown("".join(all_reasoning_parts))
+
+                            # 更新状态
+                            status_ph.caption(f"🔧 `{func_name}`")
+
+                            if func_name in ("replace_poi", "remove_poi", "add_poi",
+                                             "reroute_day", "add_day", "remove_day"):
+                                modified = True
+
+                            tool_result = rp._call_tool(func_name, args)
+                            preview = tool_result[:2000] if len(tool_result) > 2000 else tool_result
+
+                            msgs.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": tool_result,
+                            })
+
+                            # show_map 即时更新地图
+                            if func_name == "show_map":
+                                map_paths = agent.refresh_trip_rendering(rp.result)
+                                if map_paths.get("map_overview"):
+                                    st.session_state.map_overview = map_paths["map_overview"]
+                                if map_paths.get("map_days"):
+                                    st.session_state.map_days = map_paths["map_days"]
+                                    st.session_state._show_map_inline = True
+
+                            status_ph.caption(f"📋 `{func_name}` 完成 ({preview[:80]}...)")
+
+                            # ── 记录工具返回到思考面板 ──
+                            all_reasoning_parts.append(f"\n📋 **`{func_name}` 返回**\n```json\n{preview[:500]}\n```\n")
+                            think_ph.markdown("".join(all_reasoning_parts))
+
+                            # 流式输出工具返回摘要
+                            all_reply_parts.append(f"\n\n✅ `{func_name}` 执行完毕\n")
+                            reply_ph.markdown("".join(all_reply_parts))
+
+                    # ── 循环结束：构建最终回复 ──
+                    if final_text is None:
+                        final_text = "".join(all_reply_parts) or "操作已完成"
+
+                    # 显示最终回复
+                    reply_ph.markdown(final_text)
+
+                    thinking_md = "".join(all_reasoning_parts)
+
+                    # 追加到 chat_history
                     st.session_state.chat_history.append({
                         "role": "assistant",
-                        "content": "❌ 未找到行程 JSON 文件，请先生成初始行程"
+                        "content": final_text,
+                        "thinking": thinking_md,
                     })
+
+                    # 同步结果
+                    st.session_state.trip_result = rp.result
+
+                    # 重刷地图
+                    map_paths = agent.refresh_trip_rendering(rp.result)
+                    if map_paths.get("map_overview"):
+                        st.session_state.map_overview = map_paths["map_overview"]
+                    if map_paths.get("map_days"):
+                        st.session_state.map_days = map_paths["map_days"]
+                        st.session_state._show_map_inline = True
+
+                    # 保存对话上下文
+                    conv = []
+                    for m in msgs:
+                        role = m.get("role", "")
+                        content = m.get("content", "")
+                        if role in ("tool", "system"):
+                            continue
+                        if role == "assistant" and m.get("tool_calls"):
+                            if content:
+                                conv.append({"role": "assistant", "content": content})
+                            continue
+                        if role in ("user", "assistant"):
+                            conv.append({"role": role, "content": content})
+                    conv.append({"role": "assistant", "content": final_text})
+                    st.session_state._rp_conversation = conv[-20:]
+
+                    if modified:
+                        rp._auto_save()
+
+                    _save_chat()
+                    st.rerun()
+
             else:
                 # 无行程时：普通流式对话
                 proxy = OpenaiCall(api_key=ck, base_url=st.session_state.api_base)
@@ -870,6 +895,8 @@ if question := st.chat_input("输入消息…"):
                     msg["thinking"] = thinking
                 st.session_state.chat_history.append(msg)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             st.session_state.chat_history.append({"role": "assistant", "content": f"❌ 调用失败: {e}"})
 
     _save_chat()
