@@ -9,8 +9,11 @@ model/*.pdf
 README.md
 LICENSE
 imgs
-pk
-bare
-baseline
-model/eval/ablation.py
-model/eval/batch*
+model/pk/
+*.csv
+# LaTeX 编译产物
+*.tex
+*.synctex.gz
+*.aux
+*.log
+*.out
