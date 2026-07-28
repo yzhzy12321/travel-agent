@@ -67,8 +67,7 @@ class TravelAgent:
                  start_time: str = "08:00",
                  end_time: str = "20:00",
                  verbose: bool = False,
-                 model_override: Optional[str] = None,
-                 output_dir: str = "./model/output"):
+                 model_override: Optional[str] = None):
         """
         初始化 Travel Agent
 
@@ -109,7 +108,6 @@ class TravelAgent:
         self.thresh = thresh
         self.min_poi_candidate_num = min_poi_candidate_num
         self.use_rag = use_rag
-        self.output_dir = output_dir
         self.hotel_name = hotel
         self.exclude_poi_names = exclude_pois or []
 
@@ -899,211 +897,6 @@ class TravelAgent:
         self._save_qualitative(result, day_orders, day_clusters)
         return result
 
-    # ========== 后处理：刷新行程渲染 ==========
-
-    @staticmethod
-    def _amap_search_poi(name: str, city: str = None) -> tuple | None:
-        """
-        高德 POI 搜索 API，返回 (name, lat, lon) 或 None。
-        用作本地 POI 匹配失败时的 fallback。
-        """
-        import requests
-        try:
-            params = {
-                "key": GaodeMap_apikey,
-                "keywords": name,
-                "city": city or "",
-                "extensions": "all",
-                "offset": 1,
-            }
-            resp = requests.get("https://restapi.amap.com/v3/place/text", params=params, timeout=8)
-            data = resp.json()
-            if data.get("status") == "1" and int(data.get("count", 0)) > 0:
-                poi = data["pois"][0]
-                location = poi.get("location", "")
-                if location and "," in location:
-                    lon_str, lat_str = location.split(",")
-                    lon, lat = float(lon_str), float(lat_str)
-                    if 100 <= lon <= 120 and 20 <= lat <= 40:
-                        return (poi.get("name", name), lat, lon)
-        except Exception as e:
-            print(f"[_amap_search_poi] 高德 API 异常: {e}")
-        return None
-
-    def refresh_trip_rendering(self, trip_result: dict) -> dict:
-        """
-        对修改后的行程重新生成 transit_summary、timeline、地图等渲染内容。
-        Replanner 修改完 JSON 后调用此方法，确保前端展示和 pipeline 一致。
-
-        Returns:
-            dict: {"map_overview": path, "map_days": [path, ...]}
-        """
-        import datetime as dt
-        import traceback
-        import pandas as pd
-        from pathlib import Path
-
-        # 防御：检查 user_favorites 是否有效
-        if not hasattr(self, 'user_favorites') or self.user_favorites is None or len(self.user_favorites) == 0:
-            print("[refresh_trip_rendering] ⚠️ user_favorites 为空，无法生成地图")
-            return {"map_overview": None, "map_days": []}
-
-        try:
-            return self._do_refresh_trip_rendering(trip_result)
-        except Exception as e:
-            print(f"[refresh_trip_rendering] ❌ 致命错误: {e}")
-            traceback.print_exc()
-            return {"map_overview": None, "map_days": []}
-
-    def _do_refresh_trip_rendering(self, trip_result: dict) -> dict:
-        import datetime as dt
-        import traceback
-        import pandas as pd
-        from pathlib import Path
-
-        days = trip_result.get("days", [])
-        if not days:
-            print("[refresh_trip_rendering] ⚠️ trip_result 中没有 days")
-            return {}
-
-        map_paths = {"map_overview": None, "map_days": []}
-        ts = dt.datetime.now().strftime("%Y_%m_%d_%H_%M")
-        # 使用绝对路径，确保 Streamlit 任意 CWD 下都能访问
-        output_dir = Path(__file__).resolve().parent / "output"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        day_dfs = []
-
-        for day_idx, day_data in enumerate(days):
-            itinerary = day_data.get("itinerary", "")
-            if not itinerary or "->" not in itinerary:
-                print(f"[refresh_trip_rendering] ⚠️ Day{day_idx+1}: itinerary 为空或无'->'分隔符: {itinerary!r}")
-                continue
-
-            raw_names = [s.strip() for s in itinerary.split("->")]
-            print(f"[refresh_trip_rendering] Day{day_idx+1} raw_names: {raw_names}")
-
-            # 名称 → POI id 匹配（本地模糊匹配 + 高德 API fallback）
-            from thefuzz import process as fz
-            all_names = self.user_favorites["name"].tolist()
-            if not all_names:
-                print(f"[refresh_trip_rendering] ⚠️ Day{day_idx+1}: user_favorites['name'] 为空，跳过")
-                continue
-            matched_ids = []
-            amap_fallbacks = []  # 高德兜底找到的 POI：(name, lat, lon)
-            for raw in raw_names:
-                exact = self.user_favorites[self.user_favorites["name"] == raw]
-                if len(exact) > 0:
-                    matched_ids.append(exact.index[0])
-                else:
-                    matches = fz.extract(raw, all_names, limit=1)
-                    if matches:
-                        best, score = matches[0]
-                        if score > 80:
-                            matched_ids.append(self.user_favorites.index[all_names.index(best)])
-                        else:
-                            print(f"[refresh_trip_rendering] ⚠️ 本地无法匹配 POI: {raw!r} (最佳: {best!r} 得分={score})，尝试高德 API...")
-                            amap_result = self._amap_search_poi(raw)
-                            if amap_result:
-                                amap_fallbacks.append(amap_result)
-                                print(f"[refresh_trip_rendering] ✅ 高德找到: {raw!r} → ({amap_result[1]:.5f}, {amap_result[2]:.5f})")
-                            else:
-                                print(f"[refresh_trip_rendering] ❌ 高德也未找到: {raw!r}")
-                    else:
-                        print(f"[refresh_trip_rendering] ⚠️ 无法匹配 POI: {raw!r} (无候选)")
-
-            print(f"[refresh_trip_rendering] Day{day_idx+1} matched_ids: {matched_ids} (共{len(matched_ids)}个), amap_fallbacks: {len(amap_fallbacks)}个")
-
-            if len(matched_ids) < 2:
-                print(f"[refresh_trip_rendering] ⚠️ Day{day_idx+1}: 匹配到的 POI 不足 2 个，跳过地图生成")
-                continue
-
-            # 重新生成 transit_summary
-            if self.use_rag and self.rag is not None:
-                selected_names = [self.user_favorites.loc[i, "name"] for i in matched_ids]
-                locs = self.user_favorites.loc[matched_ids][["x", "y"]].astype(float).to_numpy()
-                dists = np.sqrt(np.sum(np.diff(locs, axis=0) ** 2, axis=1))
-                day_data["transit_summary"] = self.rag.get_daily_transit_summary(selected_names, dists)
-
-            # 重新生成 timeline
-            timeline = self._build_timeline(day_data, matched_ids, day_idx)
-            if timeline:
-                day_data["timeline"] = timeline
-
-            # 生成每日地图 —— 合并本地匹配 + 高德 fallback 的数据
-            df_day = self.user_favorites.loc[matched_ids].copy()
-            # 将高德 fallback 的 POI 追加到 df_day
-            for fb_name, fb_lat, fb_lon in amap_fallbacks:
-                fb_row = pd.DataFrame([{
-                    "name": fb_name, "lat": fb_lat, "lon": fb_lon,
-                    "x": fb_lon, "y": fb_lat,  # 兼容可能的列名
-                }])
-                df_day = pd.concat([df_day, fb_row], ignore_index=True)
-            day_dfs.append(df_day)
-
-            # Folium 单日地图
-            try:
-                import folium
-                m = folium.Map(
-                    location=[df_day["lat"].mean(), df_day["lon"].mean()],
-                    zoom_start=13, tiles=None
-                )
-                folium.TileLayer(
-                    tiles='https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
-                    attr='高德地图', subdomains='1234', max_zoom=18
-                ).add_to(m)
-                for _, row in df_day.iterrows():
-                    folium.Marker(
-                        location=[row["lat"], row["lon"]],
-                        popup=row["name"],
-                        icon=folium.Icon(color="blue", icon="info-sign")
-                    ).add_to(m)
-                points = list(zip(df_day["lat"], df_day["lon"]))
-                folium.PolyLine(points, color="green", weight=2.5, opacity=1).add_to(m)
-                day_path = str(output_dir / f"{ts}_{self.type}_day{day_idx+1}.html")
-                m.save(day_path)
-                map_paths["map_days"].append(day_path)
-                print(f"[refresh_trip_rendering] ✅ Day{day_idx+1} 地图已保存: {day_path}")
-            except Exception as e:
-                print(f"[refresh_trip_rendering] ❌ Day{day_idx+1} 地图生成失败: {e}")
-                traceback.print_exc()
-
-        # 生成总览地图
-        if day_dfs:
-            try:
-                import folium
-                all_lats = []; all_lons = []
-                m = folium.Map(location=[31.23, 121.47], zoom_start=12, tiles=None)
-                folium.TileLayer(
-                    tiles='https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
-                    attr='高德地图', subdomains='1234', max_zoom=18
-                ).add_to(m)
-                colors = ["green", "blue", "purple", "orange", "red", "teal", "darkblue"]
-                for di, df_day in enumerate(day_dfs):
-                    color = colors[di % len(colors)]
-                    for _, row in df_day.iterrows():
-                        folium.CircleMarker(
-                            location=[row["lat"], row["lon"]], radius=5,
-                            color=color, fill=True, popup=f"Day{di+1}: {row['name']}"
-                        ).add_to(m)
-                        all_lats.append(row["lat"]); all_lons.append(row["lon"])
-                    pts = list(zip(df_day["lat"], df_day["lon"]))
-                    folium.PolyLine(pts, color=color, weight=2.5, opacity=1,
-                                    popup=f"Day {di+1}").add_to(m)
-                if all_lats:
-                    m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
-                ov_path = str(output_dir / f"{ts}_{self.type}_overview.html")
-                m.save(ov_path)
-                map_paths["map_overview"] = ov_path
-                print(f"[refresh_trip_rendering] ✅ 总览地图已保存: {ov_path}")
-            except Exception as e:
-                print(f"[refresh_trip_rendering] ❌ 总览地图生成失败: {e}")
-                traceback.print_exc()
-
-        print(f"[refresh_trip_rendering] 完成: map_overview={map_paths['map_overview']}, map_days={len(map_paths['map_days'])}天")
-        return map_paths
-
-
     # ========== 辅助方法 ==========
 
     @staticmethod
@@ -1382,9 +1175,7 @@ class TravelAgent:
             msg = [{"role": "user", "content": get_multiday_overview_prompt(
                 num_days=self.num_days,
                 day_themes=day_themes,
-                user_reqs=self.user_reqs,
-                city_zh=self.city_zh,
-                city=self.city
+                user_reqs=self.user_reqs
             )}]
             response, _ = self.proxy.chat(messages=msg, model=self.MODEL)
             response = response.replace("'", '"')
@@ -1402,8 +1193,8 @@ class TravelAgent:
     def _save_result(self, result):
         """保存结果到 JSON 文件"""
         current_time = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
-        os.makedirs(self.output_dir, exist_ok=True)
-        filename = os.path.join(self.output_dir, f"{current_time}_{self.type}_multiday.json")
+        filename = f"./model/output/{current_time}_{self.type}_multiday.json"
+        os.makedirs("./model/output", exist_ok=True)
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         print(f"\n✅ 多日行程已保存至: {filename}")
@@ -1455,7 +1246,7 @@ class TravelAgent:
                         opacity=0.3
                     ).add_to(m)
 
-            m.save(os.path.join(self.output_dir, map_filename))
+            m.save(f'./model/output/{map_filename}')
             return m
 
         # ---- 辅助：从 LLM 响应中提取实际选中的 POI ----
@@ -1587,7 +1378,7 @@ class TravelAgent:
 
             if all_lats:
                 m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
-            m.save(os.path.join(self.output_dir, f'{current_time}_{self.type}_overview.html'))
+            m.save(f'./model/output/{current_time}_{self.type}_overview.html')
 
             print(f"🗺️  地图已保存: {current_time}_{self.type}_day*.html + _overview.html ({self.num_days+1} 张)")
 

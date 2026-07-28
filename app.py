@@ -86,10 +86,6 @@ for key, default in [
     ("_rp_modified", False),
     ("_rp_question", ""),
     ("_rp_tools", None),
-    ("_rp_conversation", []),    # 上下文记忆：累积对话历史
-    ("map_overview", None),      # Folium 总览地图路径
-    ("map_days", []),            # Folium 每日地图路径列表
-    ("_show_map_inline", False), # 标记：在对话中内联展示地图
     ("api_key_input", ""),
     ("provider", "deepseek"),
     ("preset_idx", 0),
@@ -108,37 +104,35 @@ CHAT_DIR.mkdir(exist_ok=True)
 # ==================== 辅助函数 ====================
 
 def _save_chat():
-    """保存当前对话到文件（含地图在同一文件夹）"""
+    """保存当前对话到文件"""
     if not st.session_state.chat_history:
         return
+    # 用已有 id 或新建
     chat_id = st.session_state.current_chat_id
     if not chat_id:
         first_msg = st.session_state.chat_history[0].get("content", "chat")[:30]
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         chat_id = f"{ts}_{first_msg}"
         st.session_state.current_chat_id = chat_id
+    # 清洗非法文件名字符
     safe_id = "".join(c for c in chat_id if c.isalnum() or c in "._-()[]  ") .strip()[:80]
     st.session_state.current_chat_id = safe_id
-
-    chat_folder = CHAT_DIR / safe_id
-    chat_folder.mkdir(parents=True, exist_ok=True)
 
     data = {
         "chat_history": st.session_state.chat_history,
         "trip_result": st.session_state.trip_result,
         "trip_source": st.session_state.trip_source,
+        "map_overview": st.session_state.get("map_overview"),
+        "map_days": st.session_state.get("map_days", []),
         "saved_at": datetime.datetime.now().isoformat(),
     }
-    with open(chat_folder / f"{safe_id}.json", "w", encoding="utf-8") as f:
+    with open(CHAT_DIR / f"{safe_id}.json", "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def _list_saved_chats():
     """列出所有已保存的对话"""
     chats = []
-    for f in sorted(CHAT_DIR.glob("*/*.json"), key=os.path.getmtime, reverse=True):
-        # 只读取与目录同名的 JSON（如 chat_history/<id>/<id>.json），跳过 trip.json / multiday.json 等
-        if f.stem != f.parent.name:
-            continue
+    for f in sorted(CHAT_DIR.glob("*.json"), key=os.path.getmtime, reverse=True):
         try:
             with open(f, "r", encoding="utf-8") as fp:
                 data = json.load(fp)
@@ -199,38 +193,7 @@ if st.session_state._rp_active and st.session_state._rp_msgs is not None:
                 "thinking": thinking_md,
             })
             _s.trip_result = rp.result
-            # 重刷 transit / timeline / 地图等渲染内容
-            map_paths = rp.agent.refresh_trip_rendering(_s.trip_result)
-            if map_paths.get("map_overview"):
-                _s.map_overview = map_paths["map_overview"]
-            if map_paths.get("map_days"):
-                _s.map_days = map_paths["map_days"]
-                _s._show_map_inline = True
             _save_chat()
-
-            # ── 保存对话历史供下一轮上下文记忆（过滤掉 tool 消息）──
-            conv = []
-            for m in _s._rp_msgs:
-                # 兼容 dict 和 ChatCompletionMessage 对象
-                if hasattr(m, 'role'):
-                    role = m.role
-                    content = getattr(m, 'content', '') or ''
-                    tool_calls = getattr(m, 'tool_calls', None)
-                else:
-                    role = m.get("role", "")
-                    content = m.get("content", "")
-                    tool_calls = m.get("tool_calls")
-                if role in ("tool", "system"):
-                    continue
-                if role == "assistant" and tool_calls:
-                    if content:
-                        conv.append({"role": "assistant", "content": content})
-                    continue
-                if role in ("user", "assistant"):
-                    conv.append({"role": role, "content": content})
-            conv.append({"role": "assistant", "content": resp})
-            _s._rp_conversation = conv[-20:]
-
             for k in ("_rp_active", "_rp_steps", "_rp_msgs", "_rp_replanner",
                       "_rp_modified", "_rp_question", "_rp_tools"):
                 if k in _s:
@@ -250,21 +213,12 @@ if st.session_state._rp_active and st.session_state._rp_msgs is not None:
                 args = json.loads(tc.function.arguments)
                 _s._rp_steps.append({"type": "tool_call", "name": func_name, "args": args})
 
-                if func_name in ("replace_poi", "remove_poi", "add_poi", "reroute_day", "add_day", "remove_day"):
+                if func_name in ("replace_poi", "remove_poi", "add_poi", "reroute_day"):
                     _s._rp_modified = True
 
                 tool_result = rp._call_tool(func_name, args)
                 preview = tool_result[:2000] if len(tool_result) > 2000 else tool_result
                 _s._rp_steps.append({"type": "tool_result", "name": func_name, "content": preview})
-
-                # show_map 需要即时更新地图到 session_state
-                if func_name == "show_map":
-                    map_paths = rp.agent.refresh_trip_rendering(rp.result)
-                    if map_paths.get("map_overview"):
-                        _s.map_overview = map_paths["map_overview"]
-                    if map_paths.get("map_days"):
-                        _s.map_days = map_paths["map_days"]
-                    _s._show_map_inline = True  # 标记：下一帧在对话中展示地图
 
                 msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
 
@@ -312,13 +266,6 @@ with st.sidebar.expander("🔑 API 配置", expanded=True):
         "MiniMax-abab6.5s": {"model":"abab6.5s-chat","base_url":"https://api.minimax.chat/v1","provider":"minimax"},
         "阶跃星辰 Step-2": {"model":"step-2-16k","base_url":"https://api.stepfun.com/v1","provider":"stepfun"},
         "Gemini 2.0 Flash": {"model":"gemini-2.0-flash","base_url":"https://generativelanguage.googleapis.com/v1beta/openai","provider":"gemini"},
-        "Qwen3.7-Plus（百炼）": {"model":"qwen3.7-plus","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
-        "Qwen3.7-Max（百炼）": {"model":"qwen3.7-max","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
-        "Qwen-Flash（百炼）": {"model":"qwen-flash","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
-        "DeepSeek V4 Flash（百炼）": {"model":"deepseek-v4-flash","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
-        "Kimi K2.7（百炼）": {"model":"kimi-k2.7-code","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
-        "GLM-5.2（百炼）": {"model":"glm-5.2","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
-        "MiniMax M3（百炼）": {"model":"MiniMax-M3","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","provider":"bailian"},
         "🛠️ 自定义…": {"model":"","base_url":"","provider":"custom"},
     }
     names = list(MODEL_PRESETS.keys())
@@ -346,21 +293,23 @@ with st.sidebar.expander("💾 对话记录", expanded=False):
                 label = f"{chat['title']} ({chat['msg_count']}条)"
                 if st.button(label, key=f"load_{chat['id']}", use_container_width=True,
                              help=f"保存于 {chat['saved_at'][:16]}"):
-                    with open(CHAT_DIR / chat['id'] / f"{chat['id']}.json", "r", encoding="utf-8") as f:
+                    with open(CHAT_DIR / f"{chat['id']}.json", "r", encoding="utf-8") as f:
                         data = json.load(f)
                     st.session_state.chat_history = data.get("chat_history", [])
                     st.session_state.trip_result = data.get("trip_result")
                     st.session_state.trip_source = data.get("trip_source", "generated")
+                    st.session_state.map_overview = data.get("map_overview")
+                    st.session_state.map_days = data.get("map_days", [])
                     st.session_state.current_chat_id = chat["id"]
                     st.session_state.console_logs = [f"✅ 已恢复对话: {chat['title']}"]
                     st.session_state.view_mode = "chat"
-                    # 清除旧 replan 上下文，避免串到其他行程
+                    # 清除旧 replan 上下文
                     st.session_state._rp_conversation = []
                     st.session_state._rp_active = False
                     st.rerun()
             with c_col2:
                 if st.button("🗑️", key=f"del_{chat['id']}", help="删除此对话"):
-                    import shutil; shutil.rmtree(CHAT_DIR / chat['id'], ignore_errors=True)
+                    (CHAT_DIR / f"{chat['id']}.json").unlink(missing_ok=True)
                     if st.session_state.current_chat_id == chat["id"]:
                         st.session_state.current_chat_id = None
                     st.rerun()
@@ -537,11 +486,10 @@ if st.session_state.show_planner:
             el = [x.strip() for x in exclude.split(",") if x.strip()] if exclude else None
 
             import os as _os
-            from model.config import DEEPSEEK_API_KEY,OPENAI_API_KEY,ANTHROPIC_API_KEY,MINIMAX_API_KEY,STEPFUN_API_KEY,GEMINI_API_KEY,BAILIAN_API_KEY
+            from model.config import DEEPSEEK_API_KEY,OPENAI_API_KEY,ANTHROPIC_API_KEY,MINIMAX_API_KEY,STEPFUN_API_KEY,GEMINI_API_KEY
             KEYS = {"deepseek":(DEEPSEEK_API_KEY,"DEEPSEEK_API_KEY"),"openai":(OPENAI_API_KEY,"OPENAI_API_KEY"),
                     "anthropic":(ANTHROPIC_API_KEY,"ANTHROPIC_API_KEY"),"minimax":(MINIMAX_API_KEY,"MINIMAX_API_KEY"),
-                    "stepfun":(STEPFUN_API_KEY,"STEPFUN_API_KEY"),"gemini":(GEMINI_API_KEY,"GEMINI_API_KEY"),
-                    "bailian":(BAILIAN_API_KEY,"BAILIAN_API_KEY")}
+                    "stepfun":(STEPFUN_API_KEY,"STEPFUN_API_KEY"),"gemini":(GEMINI_API_KEY,"GEMINI_API_KEY")}
             fk = st.session_state.api_key_input
             if not fk and st.session_state.provider in KEYS:
                 cfg_key, env_name = KEYS[st.session_state.provider]
@@ -551,33 +499,23 @@ if st.session_state.show_planner:
 
             with st.spinner(f"⏳ 正在规划 {city_zh} {num_days} 日游，请稍候…"):
                 try:
-                    # 预建 chat folder
-                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    chat_id = f"{ts}_{city_zh}{num_days}日游"
-                    chat_folder = CHAT_DIR / chat_id
-                    chat_folder.mkdir(parents=True, exist_ok=True)
-
                     ts_before = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
                     log_cap = io.StringIO(); _out = sys.stdout; sys.stdout = log_cap
                     proxy = OpenaiCall(api_key=fk, base_url=st.session_state.api_base)
                     planner = TravelAgent(user_reqs=[query], city=city, num_days=num_days, type="zh",
                         proxy_call=proxy, use_rag=True, travel_date=travel_date.strftime("%Y-%m-%d"),
                         citywalk=True, hotel=hotel or None, exclude_pois=el,
-                        start_time=start_time, end_time=end_time, model_override=st.session_state.llm_model,
-                        output_dir=str(chat_folder))
+                        start_time=start_time, end_time=end_time, model_override=st.session_state.llm_model)
                     trip = planner.solve_multiday()
                     sys.stdout = _out
                     st.session_state.console_logs = log_cap.getvalue().strip().split("\n")
                     st.session_state.trip_result = trip
                     st.session_state.trip_source = "generated"
-                    st.session_state.trip_planner = planner
-                    st.session_state.current_chat_id = chat_id
-                    # 新行程清除旧 replan 上下文
-                    st.session_state._rp_conversation = []
-                    st.session_state._rp_active = False
+                    st.session_state.trip_planner = planner  # 保存 agent 给 replanner 用
 
-                    # 匹配地图文件（现在在 chat_folder 里）
-                    all_html = sorted(chat_folder.glob("*.html"), key=os.path.getmtime, reverse=True)
+                    # 匹配地图文件
+                    output_dir = Path("model/output")
+                    all_html = sorted(output_dir.glob("*.html"), key=os.path.getmtime, reverse=True)
                     st.session_state.map_overview = None
                     st.session_state.map_days = []
                     for hf in all_html:
@@ -724,15 +662,14 @@ for i, msg in enumerate(st.session_state.chat_history):
                                         st.markdown(f"**{name}**")
                                         st.caption(str(desc)[:200])
 
-                # 地图：单日 → 总览地图（可折叠）；多日 → 分日标签页
+                # 地图
+                ov = st.session_state.get("map_overview")
+                if ov and os.path.exists(ov):
+                    with st.expander("🗺️ 总览地图", expanded=False):
+                        with open(ov, "r", encoding="utf-8") as f:
+                            st.components.v1.html(f.read(), height=500, scrolling=True)
                 day_maps = st.session_state.get("map_days", [])
-                if len(day_maps) <= 1:
-                    ov = st.session_state.get("map_overview")
-                    if ov and os.path.exists(ov):
-                        with st.expander("🗺️ 总览地图", expanded=False):
-                            with open(ov, "r", encoding="utf-8") as f:
-                                st.components.v1.html(f.read(), height=500, scrolling=True)
-                else:
+                if day_maps:
                     mtabs = st.tabs([f"Day {k+1} 地图" for k in range(len(day_maps))])
                     for k, (mt, mp) in enumerate(zip(mtabs, day_maps)):
                         with mt:
@@ -747,27 +684,6 @@ for i, msg in enumerate(st.session_state.chat_history):
                     st.markdown(msg["thinking"])
             st.markdown(msg["content"])
 
-# ── 内联地图：在所有对话之后、紧跟最后一条消息展示 ──
-if st.session_state.get("_show_map_inline"):
-    ov = st.session_state.get("map_overview")
-    day_maps = st.session_state.get("map_days", [])
-    # 地图：单日 → 总览地图；多日 → 分日标签页
-    if len(day_maps) <= 1:
-        if ov and os.path.exists(ov):
-            with st.chat_message("assistant"):
-                with st.expander("🗺️ 查看地图", expanded=True):
-                    with open(ov, "r", encoding="utf-8") as f:
-                        st.components.v1.html(f.read(), height=500, scrolling=True)
-    else:
-        with st.chat_message("assistant"):
-            mtabs = st.tabs([f"Day {k+1}" for k in range(len(day_maps))])
-            for k, (mt, mp) in enumerate(zip(mtabs, day_maps)):
-                with mt:
-                    if os.path.exists(mp):
-                        with open(mp, "r", encoding="utf-8") as f:
-                            st.components.v1.html(f.read(), height=500, scrolling=True)
-    st.session_state._show_map_inline = False
-
 # ── 聊天输入 ──
 if question := st.chat_input("输入消息…"):
     st.session_state.chat_history.append({"role": "user", "content": question})
@@ -777,12 +693,10 @@ if question := st.chat_input("输入消息…"):
     from model.config import (
         DEEPSEEK_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,
         MINIMAX_API_KEY, STEPFUN_API_KEY, GEMINI_API_KEY,
-        BAILIAN_API_KEY,
     )
     KC = {"deepseek": DEEPSEEK_API_KEY, "openai": OPENAI_API_KEY,
           "anthropic": ANTHROPIC_API_KEY, "minimax": MINIMAX_API_KEY,
-          "stepfun": STEPFUN_API_KEY, "gemini": GEMINI_API_KEY,
-          "bailian": BAILIAN_API_KEY}
+          "stepfun": STEPFUN_API_KEY, "gemini": GEMINI_API_KEY}
     ck = st.session_state.api_key_input or KC.get(st.session_state.provider, "")
 
     if not ck:
@@ -803,23 +717,10 @@ if question := st.chat_input("输入消息…"):
             # ── 有行程时：初始化 replan 状态机，渐进式 function calling ──
             if st.session_state.trip_result:
                 from model.replanner import Replanner, TOOLS as RP_TOOLS
-                # 从当前对话文件夹加载，确保是当前行程而非旧 model/output/
-                chat_folder = CHAT_DIR / (st.session_state.current_chat_id or "chat")
-                chat_folder.mkdir(parents=True, exist_ok=True)
-                trip_json_path = chat_folder / "trip.json"
-                # 始终写入当前 trip_result，确保与用户看到的行程一致
-                with open(trip_json_path, "w", encoding="utf-8") as f:
-                    json.dump(st.session_state.trip_result, f, ensure_ascii=False, indent=2)
-                json_files = [trip_json_path]
+                output_dir = Path(__file__).resolve().parent / "model" / "output"
+                json_files = sorted(output_dir.glob("*_multiday.json"), key=os.path.getmtime, reverse=True)
 
                 agent = st.session_state.get("trip_planner")
-                # 如果 agent 的城市与当前行程城市不一致，需要重建
-                if agent is not None:
-                    trip_city = _norm_city(st.session_state.trip_result.get("city", "fuzhou"))
-                    if agent.city != trip_city:
-                        print(f"[chat] agent 城市({agent.city})与行程({trip_city})不一致，重建 agent")
-                        agent = None
-                        st.session_state.trip_planner = None
                 if agent is None:
                     trip = st.session_state.trip_result
                     city = _norm_city(trip.get("city", "fuzhou"))
@@ -827,8 +728,7 @@ if question := st.chat_input("输入消息…"):
                     proxy = OpenaiCall(api_key=ck, base_url=st.session_state.api_base)
                     agent = TravelAgent(
                         user_reqs=["chat"], city=city, num_days=num_days,
-                        proxy_call=proxy, use_rag=False, model_override=st.session_state.llm_model,
-                        output_dir=str(CHAT_DIR / (st.session_state.current_chat_id or "chat"))
+                        proxy_call=proxy, use_rag=False, model_override=st.session_state.llm_model
                     )
                     st.session_state.trip_planner = agent
 
@@ -843,17 +743,11 @@ if question := st.chat_input("输入消息…"):
                     st.session_state._rp_replanner = rp
                     st.session_state._rp_tools = RP_TOOLS
                     st.session_state._rp_question = question
-
-                    # ── 上下文记忆：累积对话历史，LLM 能看到之前说过的话 ──
-                    sys_msg = {"role": "system", "content": rp._SYSTEM_PROMPT}
-                    user_msg = {"role": "user",
-                                "content": f"当前行程:\n{json.dumps(rp.result.get('days', []), ensure_ascii=False, indent=2)}\n\n用户请求: {question}"}
-                    prev_conv = st.session_state.get("_rp_conversation", [])
-                    if prev_conv:
-                        # 继续之前的对话
-                        st.session_state._rp_msgs = [sys_msg] + prev_conv + [user_msg]
-                    else:
-                        st.session_state._rp_msgs = [sys_msg, user_msg]
+                    st.session_state._rp_msgs = [
+                        {"role": "system", "content": rp._SYSTEM_PROMPT},
+                        {"role": "user",
+                         "content": f"当前行程:\n{json.dumps(rp.result.get('days', []), ensure_ascii=False, indent=2)}\n\n用户请求: {question}"}
+                    ]
                     st.rerun()  # 下一帧开始逐步执行 function calling
                 else:
                     st.session_state.chat_history.append({
